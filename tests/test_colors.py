@@ -3,7 +3,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from mpris_chroma import colors
 from mpris_chroma.colors import (
     clamp_hsv, hex_of, extract_colors, S_MIN, V_MIN, V_MAX, NEUTRAL_S, MAGICK,
     BANDS,
@@ -143,6 +145,22 @@ class ExtractTest(unittest.TestCase):
             self.assertAlmostEqual(_hsv(cd)[0], _hsv(cl)[0], places=1)
         for cl in light:
             self.assertGreaterEqual(_hsv(cl)[2], BANDS["light"][0] - 0.01)
+
+    def test_mode_switch_never_changes_which_colors_are_picked(self):
+        # Regression: light's narrower band shrinks RGB distances, so a color
+        # that passed COLOR_MIN_DIST in dark can collide in light — re-running
+        # selection then swaps in a different cover color, changing a hue on a
+        # theme flip. Selection must happen once; only the band moves.
+        hist = [
+            (100, (0.70, 0.60, 0.30)),  # dominant purple, dark
+            (50, (0.70, 0.60, 0.62)),   # same hue, brighter: distinct only in dark band
+            (10, (0.10, 0.80, 0.50)),   # orange that sneaks in if light re-selects
+        ]
+        with mock.patch.object(colors, "_histogram", return_value=hist):
+            dark = extract_colors(Path("unused"), mode="dark")
+            light = extract_colors(Path("unused"), mode="light")
+        for cd, cl in zip(dark, light):
+            self.assertAlmostEqual(_hsv(cd)[0], _hsv(cl)[0], places=2)
 
     def test_solid_cover_repeats_not_invents(self):
         # A truly solid cover has one color; slots repeat it rather than fabricate.

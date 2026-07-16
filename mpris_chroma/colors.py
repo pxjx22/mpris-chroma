@@ -86,18 +86,22 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
     # Most apparent first: rank by pixel count (prominence).
     ranked = sorted(hist, key=lambda e: e[0], reverse=True)
 
-    chosen: list[tuple[float, float, float]] = []
+    # Select in the historical dark band regardless of mode: light's narrower
+    # band shrinks RGB distances, and re-selecting there can swap in a
+    # different cover color — changing a hue on a theme flip. Mode must only
+    # move the brightness of the SAME three picks.
+    picked: list[tuple[float, float, float]] = []
     for _, hsv in ranked:
-        if len(chosen) == 3:
+        if len(picked) == 3:
             break
-        lifted = clamp_hsv(*hsv, mode=mode)
-        if all(_rgb_dist(lifted, c) >= COLOR_MIN_DIST for c in chosen):
-            chosen.append(lifted)
+        lifted = clamp_hsv(*hsv)
+        if all(_rgb_dist(lifted, clamp_hsv(*p)) >= COLOR_MIN_DIST for p in picked):
+            picked.append(hsv)
 
     # Fewer than three distinct colors in the cover: repeat the last real one
     # rather than fabricate a hue that isn't there.
-    while len(chosen) < 3:
-        chosen.append(chosen[-1])
+    while len(picked) < 3:
+        picked.append(picked[-1])
 
-    c1, c2, c3 = (hex_of(*c) for c in chosen)
+    c1, c2, c3 = (hex_of(*clamp_hsv(*p, mode=mode)) for p in picked)
     return c1, c2, c3
