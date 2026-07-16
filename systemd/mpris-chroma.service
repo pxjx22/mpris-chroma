@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync wlchroma background colors to MPRIS album art
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Assumes the repo is cloned at ~/mpris-chroma and wlchroma at ~/wlchroma
+# (siblings). Adjust these paths if your layout differs.
+Environment=WLCHROMA_CTL=%h/wlchroma/zig-out/bin/wlchroma-ctl
+ExecStart=python -m mpris_chroma.sync
+WorkingDirectory=%h/mpris-chroma
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

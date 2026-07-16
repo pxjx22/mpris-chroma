@@ -1,0 +1,14 @@
+[project]
+name = "mpris-chroma"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # GLib main loop + D-Bus: playerctl stdout drives track changes, while
+    # D-Bus NameOwnerChanged drives reverts when a player process exits
+    # (playerctl --follow emits no line for a vanished player).
+    "PyGObject",
+    "dbus-python",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
