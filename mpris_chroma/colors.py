@@ -11,6 +11,11 @@ NEUTRAL_S = 0.12      # at/below this saturation a pixel is treated as neutral
                       # (grayscale) and its saturation is NOT enriched
 COLOR_MIN_DIST = 0.12  # min RGB distance between the three chosen slots
 
+VIBRANCY_WEIGHT = 0.5   # how much chroma (s*v) counts vs. pixel coverage;
+                        # 0.0 restores pure most-pixels-wins ranking
+VIBRANCY_MIN_POP = 0.01  # coverage below this gets no vibrancy boost, so a
+                         # vivid noise speck can't jump the queue
+
 # Value band per theme mode. Hue and saturation always come from the cover;
 # light-vs-dark only remaps how bright the palette lands. "dark" is the
 # historical band; "light" lifts it so colors read on a light desktop theme.
@@ -60,6 +65,22 @@ def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]
     return result
 
 
+def _vibrancy_score(count: int, total: int,
+                    hsv: tuple[float, float, float]) -> float:
+    """Rank a histogram entry by coverage plus a vibrancy bonus.
+
+    Pure pixel-count ranking finds backgrounds, not identity: a mostly-black
+    cover with a brilliant logo never picks the logo. Adding chroma (s*v,
+    vivid-and-bright) lets a small vivid accent outrank a large drab region,
+    while grayscale entries (chroma 0) keep pure coverage ranking.
+    """
+    frac = count / total
+    if frac < VIBRANCY_MIN_POP:
+        return frac
+    _, s, v = hsv
+    return frac + VIBRANCY_WEIGHT * s * v
+
+
 def _rgb_dist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
     """Euclidean distance between two HSV colors in RGB space (0-1 per channel)."""
     ra, ga, ba = colorsys.hsv_to_rgb(*a)
@@ -83,8 +104,11 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
         # Pathological image: return the default accent three times.
         return "#a48ec7", "#a48ec7", "#a48ec7"
 
-    # Most apparent first: rank by pixel count (prominence).
-    ranked = sorted(hist, key=lambda e: e[0], reverse=True)
+    # Most apparent first, vibrancy-aware: coverage plus a chroma bonus, so
+    # a small vivid accent (a logo, a face) can beat a large drab background.
+    total = sum(count for count, _ in hist)
+    ranked = sorted(hist, key=lambda e: _vibrancy_score(e[0], total, e[1]),
+                    reverse=True)
 
     # Select in the historical dark band regardless of mode: light's narrower
     # band shrinks RGB distances, and re-selecting there can swap in a

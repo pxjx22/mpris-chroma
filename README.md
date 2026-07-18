@@ -30,9 +30,10 @@ resolve_cover ──► extract_colors (ImageMagick, 3 most prominent colors)
   Playing with a resolved cover, its colors are applied immediately (most recent play
   event takes precedence). When nothing is Playing — paused, stopped, or closed — the
   desktop reverts to the configured wlchroma palette.
-- **wlchroma:** all three palette slots are set to the three most prominent,
-  visibly-distinct colors in the cover, so the background takes on the album's
-  palette. Colors are only lifted for visibility, never invented — a grayscale cover
+- **wlchroma:** all three palette slots are set to the three most apparent,
+  visibly-distinct colors in the cover. Ranking is vibrancy-weighted (coverage
+  plus a chroma bonus), so a small vivid accent — a logo, a face — can take a
+  slot from a large drab background instead of the palette being all backdrop. Colors are only lifted for visibility, never invented — a grayscale cover
   stays neutral rather than being tinted. Colors cross-fade over `FADE_MS`
   (see `mpris_chroma/apply.py`) instead of snapping.
 - **Light/dark aware:** hue and saturation always come from the cover; only the
@@ -92,6 +93,8 @@ Color feel is controlled by constants at the top of
 | `BANDS` | value band per theme mode (`dark` = `V_MIN`/`V_MAX`) | light: `0.70` / `0.97` |
 | `NEUTRAL_S` | saturation at or below which grayscale stays untinted | `0.12` |
 | `COLOR_MIN_DIST` | minimum RGB distance between selected colors | `0.12` |
+| `VIBRANCY_WEIGHT` | chroma bonus vs. pixel coverage in ranking (`0.0` = most-pixels-wins) | `0.5` |
+| `VIBRANCY_MIN_POP` | coverage below this gets no vibrancy boost (noise guard) | `0.01` |
 
 ## Tests
 

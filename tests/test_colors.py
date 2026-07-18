@@ -8,7 +8,7 @@ from unittest import mock
 from mpris_chroma import colors
 from mpris_chroma.colors import (
     clamp_hsv, hex_of, extract_colors, S_MIN, V_MIN, V_MAX, NEUTRAL_S, MAGICK,
-    BANDS,
+    BANDS, VIBRANCY_WEIGHT, VIBRANCY_MIN_POP, _vibrancy_score,
 )
 
 
@@ -88,6 +88,32 @@ class ModeBandTest(unittest.TestCase):
         self.assertEqual(h_light, 0.33)
 
 
+class VibrancyScoreTest(unittest.TestCase):
+    # score = coverage + VIBRANCY_WEIGHT * chroma (chroma = s*v), so a
+    # small-but-vivid accent can outrank a large-but-drab background.
+
+    def test_vivid_accent_outranks_large_drab_region(self):
+        # The accent doesn't need to dethrone the cover's base color — it
+        # needs to beat the weakest slot. 3% vivid vs. a drab 40% region.
+        drab = _vibrancy_score(400, 1000, (0.60, 0.35, 0.20))   # 40%, muddy
+        accent = _vibrancy_score(30, 1000, (0.07, 1.0, 1.0))    # 3%, vivid
+        self.assertGreater(accent, drab)
+
+    def test_speck_gets_no_vibrancy_boost(self):
+        # Below the population floor, vividness cannot jump the queue —
+        # a lone noise pixel must not become a palette slot.
+        speck = _vibrancy_score(2, 1000, (0.07, 1.0, 1.0))
+        self.assertAlmostEqual(speck, 2 / 1000)
+
+    def test_grayscale_scores_by_coverage_only(self):
+        # Zero saturation -> zero chroma -> pure population ranking, so
+        # grayscale covers keep their existing behavior exactly.
+        big = _vibrancy_score(600, 1000, (0.0, 0.0, 0.5))
+        small = _vibrancy_score(300, 1000, (0.0, 0.0, 0.9))
+        self.assertAlmostEqual(big, 0.6)
+        self.assertGreater(big, small)
+
+
 class ExtractTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -161,6 +187,19 @@ class ExtractTest(unittest.TestCase):
             light = extract_colors(Path("unused"), mode="light")
         for cd, cl in zip(dark, light):
             self.assertAlmostEqual(_hsv(cd)[0], _hsv(cl)[0], places=2)
+
+    def test_small_vivid_accent_makes_the_palette(self):
+        # The dominance failure mode: three drab regions own the pixel count,
+        # a small vivid logo owns the identity. The accent must land a slot.
+        img = self.tmp / "accent.png"
+        _thirds(img, "#202a33", "#332028", "#2a3320")  # drab blue/plum/olive
+        subprocess.run(
+            [MAGICK, str(img), "-size", "10x10", "xc:#ff6a00",
+             "-geometry", "+27+27", "-composite", str(img)], check=True)
+        accent_hue = _hsv("#ff6a00")[0]
+        hues = [_hsv(c)[0] for c in extract_colors(img)]
+        self.assertTrue(any(abs(h - accent_hue) < 0.04 for h in hues),
+                        f"orange accent missing from {hues}")
 
     def test_solid_cover_repeats_not_invents(self):
         # A truly solid cover has one color; slots repeat it rather than fabricate.
