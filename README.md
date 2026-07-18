@@ -89,7 +89,7 @@ Color feel is controlled by constants at the top of
 |----------|---------|---------|
 | `S_MIN` | minimum saturation (lifts drab covers) | `0.45` |
 | `V_MIN` / `V_MAX` | value band (visible, not blown out) | `0.45` / `0.85` |
-| `BANDS` | value band per theme mode (`dark` = `V_MIN`/`V_MAX`) | light: `0.55` / `0.92` |
+| `BANDS` | value band per theme mode (`dark` = `V_MIN`/`V_MAX`) | light: `0.70` / `0.97` |
 | `NEUTRAL_S` | saturation at or below which grayscale stays untinted | `0.12` |
 | `COLOR_MIN_DIST` | minimum RGB distance between selected colors | `0.12` |
 

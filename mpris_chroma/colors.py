@@ -16,7 +16,7 @@ COLOR_MIN_DIST = 0.12  # min RGB distance between the three chosen slots
 # historical band; "light" lifts it so colors read on a light desktop theme.
 BANDS = {
     "dark": (V_MIN, V_MAX),
-    "light": (0.55, 0.92),
+    "light": (0.70, 0.97),
 }
 MAGICK = shutil.which("magick") or "magick"  # ImageMagick 7 binary, from PATH
 
