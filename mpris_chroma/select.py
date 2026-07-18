@@ -5,8 +5,9 @@ def select(players: dict[str, tuple[str, str | None, int]]) -> tuple[str, str | 
     recency counter (higher = updated more recently).
 
     - Any player Playing with a resolved cover -> apply the most-recent one.
-    - Players Playing but with no cover yet, or players Paused -> hold (no change).
-    - Nothing playing or paused -> revert to the default palette.
+    - Players Playing but with no cover yet -> hold (cover may still resolve).
+    - Nothing Playing (paused, stopped, or closed) -> revert to the default
+      palette: paused music has stopped mattering to the desktop.
     """
     playing = [(seq, cover) for (status, cover, seq) in players.values()
                if status == "Playing"]
@@ -15,7 +16,5 @@ def select(players: dict[str, tuple[str, str | None, int]]) -> tuple[str, str | 
         if with_cover:
             _, cover = max(with_cover)
             return "apply", cover
-        return "hold", None
-    if any(status == "Paused" for (status, _, _) in players.values()):
         return "hold", None
     return "revert", None

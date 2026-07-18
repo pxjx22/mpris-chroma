@@ -3,7 +3,7 @@
 Recolors the desktop to match the album art playing in
 [jellyfin-tui](https://github.com/dhonus/jellyfin-tui) or Spotify: the **wlchroma**
 background shader follows the current cover and reverts to the configured palette when
-playback stops or all players exit.
+playback pauses or stops, or all players exit.
 
 It runs as a single systemd **user** service on a GLib main loop (event-driven, no
 polling, single instance): `playerctl --follow` drives track/status changes, and D-Bus
@@ -28,8 +28,8 @@ resolve_cover ──► extract_colors (ImageMagick, 3 most prominent colors)
 
 - **Multi-player:** The daemon watches both `jellyfin-tui` and `spotify`. When one is
   Playing with a resolved cover, its colors are applied immediately (most recent play
-  event takes precedence). Paused status holds the current color. When all players are
-  stopped or closed, the desktop reverts to the configured wlchroma palette.
+  event takes precedence). When nothing is Playing — paused, stopped, or closed — the
+  desktop reverts to the configured wlchroma palette.
 - **wlchroma:** all three palette slots are set to the three most prominent,
   visibly-distinct colors in the cover, so the background takes on the album's
   palette. Colors are only lifted for visibility, never invented — a grayscale cover
@@ -41,8 +41,8 @@ resolve_cover ──► extract_colors (ImageMagick, 3 most prominent colors)
   you flip themes (same hues, shifted values). Set `MPRIS_CHROMA_MODE=light` or
   `dark` to force a band (skips the portal); unset follows the system, defaulting
   to dark when no portal answers or no preference is set.
-- **Revert:** Playing/Paused holds the color. When every player is Stopped **or has
-  exited**, the desktop fades back to the palette in wlchroma's config
+- **Revert:** Only Playing holds the album colors. When every player is Paused, Stopped,
+  **or has exited**, the desktop fades back to the palette in wlchroma's config
   (`[effect.settings] palette` in `~/.config/wlchroma/config.toml`), falling back to the
   named `witch_hour` palette if that config can't be read. It is also restored on service
   start/stop, so the desktop can never get stuck on an album.

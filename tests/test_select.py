@@ -22,12 +22,13 @@ class SelectTest(unittest.TestCase):
         }
         self.assertEqual(select(players), ("apply", "coverJ"))
 
-    def test_all_paused_holds(self):
+    def test_all_paused_reverts(self):
+        # Pausing means the music stopped mattering: fall back to the preset.
         players = {
             "spotify": ("Paused", "coverS", 2),
             "jellyfin-tui": ("Paused", "coverJ", 1),
         }
-        self.assertEqual(select(players), ("hold", None))
+        self.assertEqual(select(players), ("revert", None))
 
     def test_all_stopped_reverts(self):
         players = {"spotify": ("Stopped", None, 4)}

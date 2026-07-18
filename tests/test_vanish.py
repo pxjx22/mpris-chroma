@@ -43,8 +43,8 @@ class HandleVanishTest(unittest.TestCase):
             rv.assert_not_called()
             self.assertEqual(applied, "/covers/a.jpg")
 
-    def test_vanish_holds_when_another_player_still_paused(self):
-        # jellyfin-tui closes but spotify is still paused -> hold, no revert.
+    def test_vanish_reverts_when_only_paused_player_remains(self):
+        # jellyfin-tui closes and spotify is merely paused -> revert.
         players = {
             "spotify": ("Paused", None, 1),
             "jellyfin-tui": ("Playing", "/covers/j.jpg", 2),
@@ -54,8 +54,8 @@ class HandleVanishTest(unittest.TestCase):
              mock.patch.object(sync, "_revert_all") as rv:
             applied = _handle_vanish("org.mpris.MediaPlayer2.jellyfin-tui",
                                      players, applied)
-            rv.assert_not_called()
-            self.assertEqual(applied, "/covers/j.jpg")
+            rv.assert_called_once()
+            self.assertIsNone(applied)
 
 
 if __name__ == "__main__":
