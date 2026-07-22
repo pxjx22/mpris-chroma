@@ -225,7 +225,7 @@ class DestinationPolicyTest(unittest.TestCase):
     addresses is permitted, and every redirect hop is revalidated."""
 
     def _host(self):
-        return next(iter(cover.ALLOWED_HOSTS))
+        return "i.scdn.co"
 
     def test_accepts_allowlisted_https_url(self):
         cover._check_destination(f"https://{self._host()}/img/x",
@@ -272,6 +272,40 @@ class DestinationPolicyTest(unittest.TestCase):
         with self.assertRaises(cover.CoverRejected):
             handler.redirect_request(req, None, 302, "Found", {},
                                      "https://127.0.0.1/evil")
+
+
+class HostAllowlistTest(unittest.TestCase):
+    """SEC-003 refinement: a host is allowlisted if it equals a provider domain
+    or is a subdomain of one, so Spotify's several CDN subdomains all pass
+    without enumeration; new providers are added via MPRIS_CHROMA_ART_DOMAINS."""
+
+    _DOMAINS = {"scdn.co", "spotifycdn.com"}
+
+    def test_provider_domain_and_subdomains_allowed(self):
+        for h in ["scdn.co", "i.scdn.co", "mosaic.scdn.co",
+                  "image-cdn-fa.spotifycdn.com"]:
+            self.assertTrue(cover._host_allowed(h, self._DOMAINS), h)
+
+    def test_suffix_confusion_rejected(self):
+        # A leading dot is required before the domain, so lookalikes are refused.
+        for h in ["evilscdn.co", "scdn.co.attacker.com", "notspotifycdn.com",
+                  "i.scdn.co.evil.com", "example.com"]:
+            self.assertFalse(cover._host_allowed(h, self._DOMAINS), h)
+
+    def test_case_insensitive(self):
+        self.assertTrue(cover._host_allowed("I.SCDN.CO", self._DOMAINS))
+
+    def test_defaults_present_without_env(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(cover._art_domains(), cover._DEFAULT_ART_DOMAINS)
+
+    def test_env_extends_defaults(self):
+        with mock.patch.dict(os.environ,
+                             {"MPRIS_CHROMA_ART_DOMAINS": "art.example.net, cdn.foo.org"}):
+            domains = cover._art_domains()
+        self.assertIn("art.example.net", domains)
+        self.assertIn("cdn.foo.org", domains)
+        self.assertTrue(cover._DEFAULT_ART_DOMAINS <= domains)  # defaults retained
 
 
 class LocalCoverConfinementTest(unittest.TestCase):

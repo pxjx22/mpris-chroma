@@ -1,15 +1,19 @@
 import hashlib
 import ipaddress
 import logging
+import os
 import socket
 import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-# HTTPS artwork providers permitted for remote covers. The allowlist is the
-# primary SSRF control; address validation below is a DNS-rebinding backstop.
-ALLOWED_HOSTS = frozenset({"i.scdn.co", "mosaic.scdn.co"})
+# Allowlisted HTTPS artwork provider *domains*: a host passes if it equals a
+# domain or is a subdomain of one, so Spotify's several CDN subdomains all pass
+# without enumeration. The allowlist is the primary SSRF control; the global-
+# address check below is a DNS-rebinding backstop. Add a new remote provider via
+# MPRIS_CHROMA_ART_DOMAINS (comma-separated) rather than editing code.
+_DEFAULT_ART_DOMAINS = frozenset({"scdn.co", "spotifycdn.com"})
 
 # Library-style logger: a NullHandler keeps it silent unless the application
 # configures logging (sync.main does), and lets tests assert on it directly.
@@ -59,6 +63,22 @@ def _resolve_host(host: str) -> list[str]:
     return [info[4][0] for info in socket.getaddrinfo(host, None)]
 
 
+def _art_domains() -> frozenset[str]:
+    """Allowlisted provider domains: built-in defaults plus any comma-separated
+    entries from MPRIS_CHROMA_ART_DOMAINS, so a new provider needs no code
+    change."""
+    extra = os.environ.get("MPRIS_CHROMA_ART_DOMAINS", "")
+    added = {d.strip().lower() for d in extra.split(",") if d.strip()}
+    return _DEFAULT_ART_DOMAINS | added
+
+
+def _host_allowed(host: str, domains) -> bool:
+    """True if host equals an allowlisted domain or is a subdomain of one. The
+    required leading dot ('.' + domain) refuses lookalikes like 'evilscdn.co'."""
+    host = host.lower()
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
 def _is_global_address(addr: str) -> bool:
     """True only for a globally routable unicast address."""
     try:
@@ -88,7 +108,7 @@ def _check_destination(url: str, *, resolve=None) -> None:
     if parts.port not in (None, 443):
         raise CoverRejected(f"port {parts.port} not permitted")
     host = parts.hostname
-    if host is None or host not in ALLOWED_HOSTS:
+    if host is None or not _host_allowed(host, _art_domains()):
         raise CoverRejected(f"host {host!r} not allowlisted")
     addrs = resolve(host)
     if not addrs:
