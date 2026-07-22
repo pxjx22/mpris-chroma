@@ -1,8 +1,15 @@
 import os
+import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+
+# A palette entry is exactly '#' plus six hex digits. fullmatch (not $) is
+# deliberate: '$' would accept a trailing newline, and wlchroma-ctl joins argv
+# into one whitespace-delimited IPC line, so a newline-bearing value could
+# inject a second protocol line (SEC-008).
+_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 
 # wlchroma-ctl is a build output (zig-out/bin), not usually system-installed, so
 # WLCHROMA_CTL lets the service point at it; falls back to PATH then bare name.
@@ -25,18 +32,35 @@ def apply_wlchroma(c1: str, c2: str, c3: str, *, fade_ms: int = FADE_MS,
     run(cmd)
 
 
+def _valid_hex(value: object) -> str | None:
+    """Return value unchanged iff it is a well-formed '#rrggbb' string, else
+    None. Casing is preserved (wlchroma parses hex, and existing configs' IPC
+    output must not silently change); only the format is enforced, which also
+    strips whitespace/control/newline injection vectors."""
+    if not isinstance(value, str):
+        return None
+    return value if _HEX_RE.fullmatch(value) else None
+
+
 def _config_palette(config_path: Path) -> tuple[str, str, str] | None:
-    """The 3 [effect.settings] palette colors, or None if unreadable/malformed."""
+    """The 3 [effect.settings] palette colors, or None if unreadable/malformed.
+
+    Every element must be a well-formed '#rrggbb' hex string; anything else
+    (wrong type, wrong length, non-hex charset, or a whitespace/newline-bearing
+    value) yields None so the caller reverts to a safe default rather than
+    forwarding an unvalidated value to wlchroma-ctl (SEC-008)."""
     try:
         with open(config_path, "rb") as f:
             data = tomllib.load(f)
         palette = data["effect"]["settings"]["palette"]
-    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, KeyError, TypeError):
         return None
     if not isinstance(palette, list) or len(palette) != 3:
         return None
-    c1, c2, c3 = palette
-    return c1, c2, c3
+    validated = tuple(_valid_hex(c) for c in palette)
+    if any(v is None for v in validated):
+        return None
+    return validated  # type: ignore[return-value]
 
 
 def revert_wlchroma(*, ctl: str = CTL, run=subprocess.run,
