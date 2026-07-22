@@ -144,6 +144,30 @@ def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic) -> bytes:
     return b"".join(chunks)
 
 
+def _resolve_local_cover(art_url: str, root: Path | None) -> Path | None:
+    """Resolve a file:// artwork URL to a regular file confined beneath root.
+
+    Requires an empty or 'localhost' authority and a configured player root; the
+    symlink-resolved target must be a regular file at or beneath the resolved
+    root. Authority smuggling (file://host/...) and symlink escape are refused
+    (SEC-004). Returns None on any rejection."""
+    parts = urlparse(art_url)
+    if parts.netloc not in ("", "localhost"):
+        return None
+    if root is None:
+        return None
+    try:
+        real_root = root.resolve(strict=True)
+        target = Path(unquote(parts.path)).resolve(strict=True)
+    except OSError:
+        return None
+    if not target.is_file():
+        return None
+    if target != real_root and real_root not in target.parents:
+        return None
+    return target
+
+
 def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
     """Resolve the current album cover to a local image path.
 
@@ -153,9 +177,10 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
     Returns None on any failure; never raises.
     """
     if art_url.startswith("file://"):
-        p = Path(unquote(urlparse(art_url).path))
-        if p.is_file():
-            return p
+        # file:// is authoritative: a confined hit or None. It does not fall
+        # through to the covers_dir scan, which would re-admit a symlink the
+        # confinement just rejected; that scan remains for non-URL art_urls.
+        return _resolve_local_cover(art_url, covers_dir)
     elif art_url.startswith(("http://", "https://")):
         dest = _cache_path(art_url)
         if dest.is_file():

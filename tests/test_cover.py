@@ -24,12 +24,12 @@ class ResolveCoverTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_file_url_that_exists_is_used(self):
-        img = self.tmp / "art.jpg"
-        img.write_bytes(b"x")
+    def test_file_url_inside_root_is_used(self):
         covers = self.tmp / "covers"
         covers.mkdir()
-        self.assertEqual(resolve_cover(f"file://{img}", covers), img)
+        img = covers / "art.jpg"
+        img.write_bytes(b"x")
+        self.assertEqual(resolve_cover(f"file://{img}", covers), img.resolve())
 
     def test_remote_url_falls_back_to_newest_cover(self):
         covers = self.tmp / "covers"
@@ -272,6 +272,56 @@ class DestinationPolicyTest(unittest.TestCase):
         with self.assertRaises(cover.CoverRejected):
             handler.redirect_request(req, None, 302, "Found", {},
                                      "https://127.0.0.1/evil")
+
+
+class LocalCoverConfinementTest(unittest.TestCase):
+    """SEC-004: file:// is confined beneath a player's configured root, with
+    explicit authority handling and symlink-escape refusal."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.root = self.base / "covers"
+        self.root.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_accepts_cover_inside_root(self):
+        img = self.root / "art.jpg"
+        img.write_bytes(b"x")
+        self.assertEqual(resolve_cover(f"file://{img}", self.root), img.resolve())
+
+    def test_accepts_localhost_authority(self):
+        img = self.root / "art.jpg"
+        img.write_bytes(b"x")
+        self.assertEqual(resolve_cover(f"file://localhost{img}", self.root),
+                         img.resolve())
+
+    def test_rejects_path_outside_root(self):
+        outside = self.base / "secret.txt"
+        outside.write_bytes(b"x")
+        self.assertIsNone(resolve_cover(f"file://{outside}", self.root))
+
+    def test_rejects_etc_passwd(self):
+        self.assertIsNone(resolve_cover("file:///etc/passwd", self.root))
+
+    def test_rejects_remote_authority(self):
+        img = self.root / "art.jpg"
+        img.write_bytes(b"x")
+        self.assertIsNone(resolve_cover(f"file://remote-host{img}", self.root))
+
+    def test_rejects_symlink_escaping_root(self):
+        outside = self.base / "secret.txt"
+        outside.write_bytes(b"x")
+        link = self.root / "link.jpg"
+        link.symlink_to(outside)
+        self.assertIsNone(resolve_cover(f"file://{link}", self.root))
+
+    def test_rejects_when_no_root_configured(self):
+        img = self.root / "art.jpg"
+        img.write_bytes(b"x")
+        self.assertIsNone(resolve_cover(f"file://{img}", None))
 
 
 if __name__ == "__main__":
