@@ -156,5 +156,52 @@ class FetchBoundsTest(unittest.TestCase):
         self.assertEqual(data, b"IMGDATA")
 
 
+class ResolveCoverErrorHandlingTest(unittest.TestCase):
+    """SEC-015: expected network/disk/validation failures are contained and
+    logged; unexpected programming errors propagate instead of masquerading as
+    'no cover'; repeated failures are rate-limited so they cannot flood logs."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = cover.CACHE_DIR
+        cover.CACHE_DIR = Path(self._tmp.name)
+        cover._last_logged.clear()
+
+    def tearDown(self):
+        cover.CACHE_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_cover_error_is_contained_as_none(self):
+        with mock.patch.object(cover, "_fetch", side_effect=cover.CoverTooLarge("big")):
+            self.assertIsNone(resolve_cover("https://i.scdn.co/image/x"))
+
+    def test_programming_error_propagates(self):
+        # A TypeError is a bug, not an operational failure; it must reach the
+        # supervisor rather than be silently converted to None.
+        with mock.patch.object(cover, "_fetch", side_effect=TypeError("bug")):
+            with self.assertRaises(TypeError):
+                resolve_cover("https://i.scdn.co/image/x")
+
+    def test_memory_error_propagates(self):
+        with mock.patch.object(cover, "_fetch", side_effect=MemoryError()):
+            with self.assertRaises(MemoryError):
+                resolve_cover("https://i.scdn.co/image/x")
+
+    def test_repeated_failures_are_rate_limited_in_logs(self):
+        with mock.patch.object(cover, "_fetch", side_effect=OSError("net")), \
+             mock.patch.object(cover._log, "warning") as warn:
+            resolve_cover("https://i.scdn.co/image/x")
+            resolve_cover("https://i.scdn.co/image/x")
+        self.assertEqual(warn.call_count, 1)
+
+    def test_failure_log_omits_url_credentials(self):
+        with mock.patch.object(cover, "_fetch", side_effect=OSError("net")), \
+             mock.patch.object(cover._log, "warning") as warn:
+            resolve_cover("https://user:secret@i.scdn.co/image/x?token=abc")
+        logged = " ".join(str(a) for a in warn.call_args.args)
+        self.assertNotIn("secret", logged)
+        self.assertNotIn("token", logged)
+
+
 if __name__ == "__main__":
     unittest.main()

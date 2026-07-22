@@ -1,3 +1,4 @@
+import logging
 import os
 import signal
 import subprocess
@@ -124,6 +125,10 @@ def main():
     import dbus
     from dbus.mainloop.glib import DBusGMainLoop
     from gi.repository import GLib, GLibUnix
+
+    # Surface contained cover failures (SEC-015) in the journal. Without an app
+    # handler the library logger's NullHandler keeps them silent.
+    logging.basicConfig(level=logging.WARNING)
 
     DBusGMainLoop(set_as_default=True)
     loop = GLib.MainLoop()

@@ -1,8 +1,16 @@
 import hashlib
+import logging
 import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+
+# Library-style logger: a NullHandler keeps it silent unless the application
+# configures logging (sync.main does), and lets tests assert on it directly.
+_log = logging.getLogger("mpris_chroma.cover")
+_log.addHandler(logging.NullHandler())
+_LOG_INTERVAL = 60.0  # seconds; at most one warning per key per interval
+_last_logged: dict[str, float] = {}
 
 CACHE_DIR = Path.home() / ".cache/mpris-chroma/covers"
 DOWNLOAD_TIMEOUT = 5       # per-socket-operation timeout (seconds)
@@ -25,6 +33,15 @@ class CoverTimeout(CoverError):
 
 def _cache_path(url: str) -> Path:
     return CACHE_DIR / (hashlib.sha256(url.encode()).hexdigest() + ".img")
+
+
+def _log_failure(key: str, message: str, *, now=time.monotonic) -> None:
+    """Warn about a cover failure at most once per _LOG_INTERVAL per key, so a
+    repeatedly-failing source cannot flood the journal."""
+    t = now()
+    if t - _last_logged.get(key, float("-inf")) >= _LOG_INTERVAL:
+        _last_logged[key] = t
+        _log.warning(message)
 
 
 def _fetch(url: str, *, opener=urllib.request.urlopen, now=time.monotonic) -> bytes:
@@ -82,7 +99,14 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
                 return None
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
-        except Exception:
+        except (OSError, CoverError) as exc:
+            # Expected operational failures (network via URLError/HTTPError/
+            # socket timeout, filesystem, or a bounded-download rejection) are
+            # contained. Unexpected exceptions (MemoryError, programming bugs)
+            # deliberately propagate to the supervisor. Log only the hostname so
+            # URL userinfo/query secrets never reach the journal.
+            host = urlparse(art_url).hostname or "?"
+            _log_failure(host, f"cover fetch failed for {host}: {type(exc).__name__}")
             return None
         return dest
 
