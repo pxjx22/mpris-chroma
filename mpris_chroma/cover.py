@@ -1,9 +1,15 @@
 import hashlib
+import ipaddress
 import logging
+import socket
 import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse, unquote
+
+# HTTPS artwork providers permitted for remote covers. The allowlist is the
+# primary SSRF control; address validation below is a DNS-rebinding backstop.
+ALLOWED_HOSTS = frozenset({"i.scdn.co", "mosaic.scdn.co"})
 
 # Library-style logger: a NullHandler keeps it silent unless the application
 # configures logging (sync.main does), and lets tests assert on it directly.
@@ -31,6 +37,10 @@ class CoverTimeout(CoverError):
     """The total-transfer deadline elapsed before the body finished."""
 
 
+class CoverRejected(CoverError):
+    """A destination or local path was refused by policy (SSRF / confinement)."""
+
+
 def _cache_path(url: str) -> Path:
     return CACHE_DIR / (hashlib.sha256(url.encode()).hexdigest() + ".img")
 
@@ -44,7 +54,64 @@ def _log_failure(key: str, message: str, *, now=time.monotonic) -> None:
         _log.warning(message)
 
 
-def _fetch(url: str, *, opener=urllib.request.urlopen, now=time.monotonic) -> bytes:
+def _resolve_host(host: str) -> list[str]:
+    """Resolve all A/AAAA addresses for host (network; injected in tests)."""
+    return [info[4][0] for info in socket.getaddrinfo(host, None)]
+
+
+def _is_global_address(addr: str) -> bool:
+    """True only for a globally routable unicast address."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        return False
+    return ip.is_global
+
+
+def _check_destination(url: str, *, resolve=None) -> None:
+    """Raise CoverRejected unless url is https to an allowlisted host on a
+    default port, without userinfo, resolving only to global addresses.
+
+    The allowlist is the primary control; the address check is a DNS-rebinding
+    backstop. Pure given the injected resolver, so it is unit-testable without
+    a network."""
+    if resolve is None:
+        resolve = _resolve_host
+    parts = urlparse(url)
+    if parts.scheme != "https":
+        raise CoverRejected(f"non-https scheme {parts.scheme!r}")
+    if parts.username or parts.password:
+        raise CoverRejected("url userinfo not permitted")
+    if parts.port not in (None, 443):
+        raise CoverRejected(f"port {parts.port} not permitted")
+    host = parts.hostname
+    if host is None or host not in ALLOWED_HOSTS:
+        raise CoverRejected(f"host {host!r} not allowlisted")
+    addrs = resolve(host)
+    if not addrs:
+        raise CoverRejected(f"no addresses for {host}")
+    for addr in addrs:
+        if not _is_global_address(addr):
+            raise CoverRejected(f"non-global address {addr} for {host}")
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Revalidate every redirect hop against the destination policy so a public
+    URL cannot bounce to an internal target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_destination(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Default opener: urllib caps redirects at 10 and each hop is revalidated.
+_OPENER = urllib.request.build_opener(_ValidatingRedirectHandler())
+
+
+def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic) -> bytes:
     """Fetch raw bytes for a URL, bounded by MAX_COVER_BYTES and DOWNLOAD_DEADLINE.
 
     The urlopen timeout bounds a single socket operation, not the whole
@@ -94,6 +161,7 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
         if dest.is_file():
             return dest
         try:
+            _check_destination(art_url)
             data = _fetch(art_url)
             if not data:
                 return None

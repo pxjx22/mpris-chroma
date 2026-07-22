@@ -2,11 +2,18 @@ import os
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
 from mpris_chroma import cover
 from mpris_chroma.cover import resolve_cover
+
+_GLOBAL_ADDR = "23.192.228.84"  # a public (globally routable) address
+
+
+def _resolves_to(*addrs):
+    return lambda host: list(addrs)
 
 
 class ResolveCoverTest(unittest.TestCase):
@@ -48,13 +55,18 @@ class ResolveCoverTest(unittest.TestCase):
 
 class HttpCoverTest(unittest.TestCase):
     def setUp(self):
-        # Redirect the cache into a temp dir so tests never touch ~/.cache.
-        self._tmp = __import__("tempfile").TemporaryDirectory()
+        # Redirect the cache into a temp dir so tests never touch ~/.cache, and
+        # mock DNS so destination validation stays offline and deterministic.
+        self._tmp = tempfile.TemporaryDirectory()
         self.cache = Path(self._tmp.name)
         self._orig = cover.CACHE_DIR
         cover.CACHE_DIR = self.cache
+        self._dns = mock.patch.object(cover, "_resolve_host",
+                                      return_value=[_GLOBAL_ADDR])
+        self._dns.start()
 
     def tearDown(self):
+        self._dns.stop()
         cover.CACHE_DIR = self._orig
         self._tmp.cleanup()
 
@@ -166,8 +178,12 @@ class ResolveCoverErrorHandlingTest(unittest.TestCase):
         self._orig = cover.CACHE_DIR
         cover.CACHE_DIR = Path(self._tmp.name)
         cover._last_logged.clear()
+        self._dns = mock.patch.object(cover, "_resolve_host",
+                                      return_value=[_GLOBAL_ADDR])
+        self._dns.start()
 
     def tearDown(self):
+        self._dns.stop()
         cover.CACHE_DIR = self._orig
         self._tmp.cleanup()
 
@@ -201,6 +217,61 @@ class ResolveCoverErrorHandlingTest(unittest.TestCase):
         logged = " ".join(str(a) for a in warn.call_args.args)
         self.assertNotIn("secret", logged)
         self.assertNotIn("token", logged)
+
+
+class DestinationPolicyTest(unittest.TestCase):
+    """SEC-003: _check_destination is the pure allow/deny gate (given an
+    injected resolver); only https to an allowlisted host resolving to global
+    addresses is permitted, and every redirect hop is revalidated."""
+
+    def _host(self):
+        return next(iter(cover.ALLOWED_HOSTS))
+
+    def test_accepts_allowlisted_https_url(self):
+        cover._check_destination(f"https://{self._host()}/img/x",
+                                 resolve=_resolves_to(_GLOBAL_ADDR))  # no raise
+
+    def test_rejects_non_https_scheme(self):
+        with self.assertRaises(cover.CoverRejected):
+            cover._check_destination(f"http://{self._host()}/x",
+                                     resolve=_resolves_to(_GLOBAL_ADDR))
+
+    def test_rejects_url_userinfo(self):
+        with self.assertRaises(cover.CoverRejected):
+            cover._check_destination(f"https://user:pw@{self._host()}/x",
+                                     resolve=_resolves_to(_GLOBAL_ADDR))
+
+    def test_rejects_nonstandard_port(self):
+        with self.assertRaises(cover.CoverRejected):
+            cover._check_destination(f"https://{self._host()}:8080/x",
+                                     resolve=_resolves_to(_GLOBAL_ADDR))
+
+    def test_rejects_non_allowlisted_host(self):
+        with self.assertRaises(cover.CoverRejected):
+            cover._check_destination("https://evil.example/x",
+                                     resolve=_resolves_to(_GLOBAL_ADDR))
+
+    def test_rejects_non_global_addresses(self):
+        for addr in ["127.0.0.1", "::1", "10.0.0.1", "192.168.1.1", "172.16.0.1",
+                     "169.254.1.1", "fe80::1", "224.0.0.1", "240.0.0.1",
+                     "0.0.0.0", "::"]:
+            with self.subTest(addr=addr):
+                with self.assertRaises(cover.CoverRejected):
+                    cover._check_destination(f"https://{self._host()}/x",
+                                             resolve=_resolves_to(addr))
+
+    def test_rejects_when_any_resolved_address_is_non_global(self):
+        # A mix must reject: one private answer is enough (rebinding backstop).
+        with self.assertRaises(cover.CoverRejected):
+            cover._check_destination(f"https://{self._host()}/x",
+                                     resolve=_resolves_to(_GLOBAL_ADDR, "127.0.0.1"))
+
+    def test_redirect_to_loopback_is_rejected(self):
+        handler = cover._ValidatingRedirectHandler()
+        req = urllib.request.Request(f"https://{self._host()}/a")
+        with self.assertRaises(cover.CoverRejected):
+            handler.redirect_request(req, None, 302, "Found", {},
+                                     "https://127.0.0.1/evil")
 
 
 if __name__ == "__main__":
