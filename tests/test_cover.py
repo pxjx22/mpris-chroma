@@ -97,5 +97,64 @@ class HttpCoverTest(unittest.TestCase):
             self.assertIsNone(resolve_cover(url))
 
 
+class FakeResp:
+    """Minimal stand-in for a urlopen() response/context manager."""
+
+    def __init__(self, chunks, headers=None):
+        self._chunks = list(chunks)
+        self.headers = headers or {}
+        self.read_called = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        self.read_called = True
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def _opener_for(resp):
+    def _open(url, timeout=None):
+        return resp
+    return _open
+
+
+class FetchBoundsTest(unittest.TestCase):
+    """SEC-002: downloads are bounded by a byte cap and a total-transfer
+    deadline, streamed so peak memory does not scale with the response."""
+
+    def test_oversized_declared_length_rejected_before_reading_body(self):
+        resp = FakeResp(
+            [b"x" * 1024],
+            headers={"Content-Length": str(cover.MAX_COVER_BYTES + 1)},
+        )
+        with self.assertRaises(cover.CoverTooLarge):
+            cover._fetch("https://h/x", opener=_opener_for(resp))
+        self.assertFalse(resp.read_called)  # rejected before any body read
+
+    def test_oversized_chunked_body_stopped_at_cap(self):
+        # No declared length; the cap must be enforced against actual bytes.
+        resp = FakeResp([b"aaaa", b"bbbb", b"cccc"])  # 12 bytes
+        with mock.patch.object(cover, "MAX_COVER_BYTES", 8):
+            with self.assertRaises(cover.CoverTooLarge):
+                cover._fetch("https://h/x", opener=_opener_for(resp))
+
+    def test_total_deadline_aborts_slow_drip(self):
+        resp = FakeResp([b"a"] * 1000)  # would never end on its own
+        clock = iter([0.0, cover.DOWNLOAD_DEADLINE + 1.0])  # start, then past deadline
+        with self.assertRaises(cover.CoverTimeout):
+            cover._fetch("https://h/x", opener=_opener_for(resp),
+                         now=lambda: next(clock))
+
+    def test_normal_sized_image_succeeds(self):
+        resp = FakeResp([b"IMG", b"DATA"])
+        data = cover._fetch("https://h/x", opener=_opener_for(resp),
+                            now=lambda: 0.0)
+        self.assertEqual(data, b"IMGDATA")
+
+
 if __name__ == "__main__":
     unittest.main()
