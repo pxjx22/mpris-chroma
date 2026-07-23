@@ -18,18 +18,19 @@ and applies them with a smooth fade.
 playerctl --follow (jellyfin-tui, spotify MPRIS)
         │  status + mpris:artUrl
         ▼
-select(players) ──► apply whichever is currently playing
-        │          (most recent play event wins)
+coordinator: decide(players) ──► desired palette (newest Playing wins)
+        │   parses + schedules only — never blocks the GLib loop
         ▼
-resolve_cover ──► extract_colors (Pillow, 3 most prominent colors)
-        │
+worker thread ──► resolve_cover ──► extract_colors (Pillow, 3 prominent colors)
+        │   (bounded, coalesced to the newest cover; stale results rejected)
         └─► wlchroma: wlchroma-ctl set-colors <c1> <c2> <c3> <fade_ms>
 ```
 
-- **Multi-player:** The daemon watches both `jellyfin-tui` and `spotify`. When one is
-  Playing with a resolved cover, its colors are applied immediately (most recent play
-  event takes precedence). When nothing is Playing — paused, stopped, or closed — the
-  desktop reverts to the configured wlchroma palette.
+- **Multi-player:** The daemon watches both `jellyfin-tui` and `spotify`. The most
+  recent Playing player's cover is applied (most recent play event takes precedence);
+  its download and decode run on a background worker, so the daemon stays responsive
+  and only the newest cover is ever applied. When nothing is Playing — paused, stopped,
+  or closed — the desktop reverts to the configured wlchroma palette.
 - **wlchroma:** all three palette slots are set to the three most apparent,
   visibly-distinct colors in the cover. Ranking is vibrancy-weighted (coverage
   plus a chroma bonus), so a small vivid accent — a logo, a face — can take a
