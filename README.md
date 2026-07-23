@@ -21,7 +21,7 @@ playerctl --follow (jellyfin-tui, spotify MPRIS)
 select(players) ──► apply whichever is currently playing
         │          (most recent play event wins)
         ▼
-resolve_cover ──► extract_colors (ImageMagick, 3 most prominent colors)
+resolve_cover ──► extract_colors (Pillow, 3 most prominent colors)
         │
         └─► wlchroma: wlchroma-ctl set-colors <c1> <c2> <c3> <fade_ms>
 ```
@@ -58,14 +58,18 @@ resolve_cover ──► extract_colors (ImageMagick, 3 most prominent colors)
   the cached cover in `~/.local/share/jellyfin-tui/covers/` (confirmed on jellyfin-tui
   1.5.0). A newest-file-in-covers fallback covers other cases.
 - Spotify (optional) — the official client (via `spotify-launcher`) exposes MPRIS
-  as player `spotify` with an `http(s)` `mpris:artUrl`. Its art is downloaded and
-  cached under `~/.cache/mpris-chroma/covers/`.
-- ImageMagick 7 (`magick` on `PATH`) — color extraction.
+  as player `spotify` with an `http(s)` `mpris:artUrl`. Its art is downloaded (HTTPS
+  to an allowlisted provider domain only, size- and deadline-bounded) and cached
+  under `~/.cache/mpris-chroma/covers/`. The cache is bounded — least-recently-used
+  entries are evicted past 30 days or a 128 MiB / 512-entry budget.
 - [wlchroma](../wlchroma) built with the `set-colors` IPC command, running. The service
   assumes this repo is at `~/mpris-chroma` and wlchroma at `~/wlchroma` (siblings);
   override `WLCHROMA_CTL` in a systemd drop-in if your layout differs.
 - Python 3.11+ with **PyGObject** (`gi`) and **dbus-python** (`dbus`) — the GLib loop
-  and D-Bus vanish detection. On Arch: `python-gobject`, `python-dbus`.
+  and D-Bus vanish detection — and **Pillow** (`PIL`) for in-process cover decoding.
+  On Arch: `python-gobject`, `python-dbus`, `python-pillow`. Cover art is decoded
+  in-process (JPEG/PNG/WebP only, validated by signature); there is no ImageMagick
+  dependency.
 
 ## Install / uninstall
 
@@ -103,5 +107,6 @@ python -m unittest discover -s tests -v
 ```
 
 Pure logic (cover resolution, color extraction, state transitions) is separated from
-subprocess I/O, so the suite runs without a live Wayland session. (ImageMagick is
-required for the color-extraction tests, which generate fixtures on the fly.)
+subprocess I/O, so the suite runs without a live Wayland session. The
+color-extraction tests generate their image fixtures in-process with Pillow, so no
+external image tooling is required.
