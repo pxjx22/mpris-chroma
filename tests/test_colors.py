@@ -281,5 +281,50 @@ class FormatAllowlistTest(unittest.TestCase):
         self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
 
 
+class DecodeBoundsTest(unittest.TestCase):
+    """SEC-006: in-process containment for the Pillow decode path — an
+    oversized-dimension image (a decompression bomb) and an oversized file are
+    refused before their pixels are decoded, so a malicious cover cannot exhaust
+    memory. Normal and multi-frame covers still extract."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_rejects_oversized_dimensions(self):
+        # Valid PNG, but its header declares more pixels than the decode budget.
+        # The guard must reject it from the header, before decoding the body.
+        p = self.tmp / "bomb.png"
+        Image.new("RGB", (4100, 4100), (224, 16, 80)).save(p, "PNG")  # ~16.8 MP
+        self.assertGreater(4100 * 4100, colors._MAX_PIXELS)
+        self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_rejects_oversized_file_bytes(self):
+        # A file larger than the byte budget is refused before Image.open, so a
+        # huge local cover cannot be streamed into the decoder.
+        p = self.tmp / "huge.png"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "PNG")
+        with mock.patch.object(colors, "_MAX_DECODE_BYTES", 8):
+            self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_within_budget_still_extracts(self):
+        # A normal-sized cover stays under both budgets and extracts a palette.
+        p = self.tmp / "ok.png"
+        Image.new("RGB", (640, 640), (224, 16, 80)).save(p, "PNG")
+        self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_animated_webp_decodes_first_frame(self):
+        # Multi-frame content is bounded to its first frame; it must not crash
+        # or iterate every frame.
+        p = self.tmp / "anim.webp"
+        frame1 = Image.new("RGB", (64, 64), (224, 16, 80))
+        frame2 = Image.new("RGB", (64, 64), (16, 80, 224))
+        frame1.save(p, "WEBP", save_all=True, append_images=[frame2], duration=100)
+        self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+
 if __name__ == "__main__":
     unittest.main()

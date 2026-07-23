@@ -30,6 +30,17 @@ _ACCEPTED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
 _SAMPLE = (100, 100)   # downsample target, mirrors the old `-resize 100x100`
 _QUANTIZE_COLORS = 16  # palette size, mirrors the old `-colors 16`
 
+# In-process decode containment (SEC-006). The ImageMagick subprocess is gone,
+# so its `-limit` ceilings become Pillow-side bounds: reject a file larger than
+# the byte budget before opening it, and an image whose declared dimensions
+# exceed the pixel budget before decoding its body — that header-first check is
+# the decompression-bomb guard. Both are far above real album art (Spotify
+# 640x640, Jellyfin up to a few thousand px) and far below anything that could
+# exhaust the daemon. Decoded memory is then fixed by the 100x100 downsample.
+_MAX_DECODE_BYTES = 16 * 1024 * 1024  # 16 MiB; bounds local covers, which are
+                                      # not size-capped by the download path
+_MAX_PIXELS = 16_000_000              # ~16 MP declared-dimension ceiling
+
 
 def clamp_hsv(h: float, s: float, v: float,
               mode: str = "dark") -> tuple[float, float, float]:
@@ -59,13 +70,19 @@ def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]
     maps to the safe default palette (SEC-005).
     """
     try:
+        if image_path.stat().st_size > _MAX_DECODE_BYTES:
+            return []
         with Image.open(image_path) as img:
-            # `.format` is set from the signature during the lazy open, before
-            # any pixel decoding — reject unaccepted formats here, up front.
+            # `.format` and `.size` are set from the header during the lazy
+            # open, before any pixel decoding — reject an unaccepted format or
+            # an over-budget (decompression-bomb) size here, up front, so a
+            # malicious cover's body is never decoded.
             if img.format not in _ACCEPTED_FORMATS:
                 return []
+            if img.width * img.height > _MAX_PIXELS:
+                return []
             sample = img.convert("RGB").resize(_SAMPLE)
-    except (OSError, UnidentifiedImageError):
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError):
         return []
     quantized = sample.quantize(colors=_QUANTIZE_COLORS)
     palette = quantized.getpalette()  # flat [r, g, b, r, g, b, ...]
