@@ -74,6 +74,19 @@ def _follow_cmd():
     ]
 
 
+def _submit_guarded(item, worker, mailbox, on_worker_dead) -> None:
+    """Put `item` on the worker's mailbox, unless the worker thread has died — in
+    which case invoke on_worker_dead() and drop it. Defense in depth (SEC-001
+    §2.3): a BaseException (e.g. MemoryError) can kill the worker past _serve's
+    Exception backstop; a daemon that kept accepting jobs nothing runs would
+    degrade silently behind a healthy-looking PID, so instead we exit non-zero
+    for systemd Restart=on-failure to recover."""
+    if not worker.is_alive():
+        on_worker_dead()
+        return
+    mailbox.put(item)
+
+
 def _bounded_revert() -> None:
     """Revert to the config preset directly, containing a ctl failure. Used at
     startup (loop not running yet) and once more at shutdown after the worker is
@@ -124,12 +137,26 @@ def main():
     _bounded_revert()
 
     mailbox = Mailbox()
-    coordinator = Coordinator(submit=mailbox.put, covers_dir_for=COVERS_DIRS.get,
-                              mode=mode)
 
     # Shutdown flips this; the worker's resolve stage polls it so an in-flight
     # download aborts promptly instead of waiting out the transfer deadline.
     stopping = threading.Event()
+
+    def _on_worker_dead():
+        # Same exit path as an unexpected playerctl death (HUP): exit non-zero so
+        # systemd Restart=on-failure recovers instead of the daemon degrading.
+        nonlocal exit_code
+        _log.critical("palette worker thread died; exiting for restart")
+        exit_code = 1
+        loop.quit()
+
+    # `worker` is referenced late-bound (defined below); submit is only called
+    # from event handlers, which fire after loop.run(), so it always exists then.
+    def _submit(item):
+        _submit_guarded(item, worker, mailbox, _on_worker_dead)
+
+    coordinator = Coordinator(submit=_submit, covers_dir_for=COVERS_DIRS.get,
+                              mode=mode)
 
     def _post(result):
         # Marshal a worker result to the main thread; return False so the idle

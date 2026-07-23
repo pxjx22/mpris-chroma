@@ -1,7 +1,31 @@
 import subprocess
+import types
 import unittest
 
 from mpris_chroma import sync
+
+
+class SubmitGuardTest(unittest.TestCase):
+    """A live worker's job is put on the mailbox; a dead worker (killed by a
+    BaseException past _serve's backstop) instead triggers the exit path so the
+    daemon does not silently accept jobs nothing runs (SEC-001 §2.3)."""
+
+    def _guard(self, alive):
+        put, dead = [], []
+        worker = types.SimpleNamespace(is_alive=lambda: alive)
+        mailbox = types.SimpleNamespace(put=put.append)
+        sync._submit_guarded((1, "d"), worker, mailbox, lambda: dead.append(1))
+        return put, dead
+
+    def test_live_worker_receives_the_job(self):
+        put, dead = self._guard(alive=True)
+        self.assertEqual(put, [(1, "d")])
+        self.assertEqual(dead, [])
+
+    def test_dead_worker_triggers_exit_and_drops_the_job(self):
+        put, dead = self._guard(alive=False)
+        self.assertEqual(put, [])
+        self.assertEqual(dead, [1])
 
 
 class _FakeProc:
