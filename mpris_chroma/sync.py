@@ -131,6 +131,22 @@ def _handle_scheme_change(value: int, applied, mode: str) -> str:
     return new_mode
 
 
+# Subprocess policy (PY-002). After the Pillow migration the daemon has exactly
+# two kinds of subprocess, each with one documented lifecycle helper:
+#   * short wlchroma-ctl calls  -> apply._run_ctl (bounded by CTL_TIMEOUT,
+#     exit-status checked, stderr excerpt captured);
+#   * the one long-lived playerctl watcher -> _spawn_follow below, reaped by
+#     _terminate_child. Both use argv lists; nothing uses shell=True.
+
+
+def _spawn_follow(*, popen=subprocess.Popen):
+    """Spawn the long-lived playerctl watcher (PY-002). Lifecycle policy: an
+    argv list (never shell=True), stdout piped for the GLib IO watch, stderr
+    inherited to the journal. It runs for the daemon's lifetime and is reaped by
+    _terminate_child within CHILD_STOP_TIMEOUT."""
+    return popen(_follow_cmd(), stdout=subprocess.PIPE)
+
+
 def _terminate_child(proc, *, timeout: int = CHILD_STOP_TIMEOUT) -> None:
     """Terminate the playerctl child and guarantee it is reaped within `timeout`:
     SIGTERM, wait up to `timeout`, then SIGKILL and an unbounded reap if it
@@ -212,7 +228,7 @@ def main():
     # an exception while wiring the IO channel or signal receivers below would
     # otherwise leak the playerctl child. `channel` starts None so the finally
     # can tell whether it was created (SEC-013).
-    proc = subprocess.Popen(_follow_cmd(), stdout=subprocess.PIPE)
+    proc = _spawn_follow()
     channel = None
     try:
         channel = GLib.IOChannel.unix_new(proc.stdout.fileno())

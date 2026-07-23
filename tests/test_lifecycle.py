@@ -54,5 +54,27 @@ class TerminateChildTest(unittest.TestCase):
         sync._terminate_child(p, timeout=1)  # must not raise
 
 
+class SpawnFollowTest(unittest.TestCase):
+    """PY-002: the playerctl watcher is spawned through one documented policy
+    helper — an argv list (never shell=True) with stdout piped for the GLib
+    watch — the daemon's only long-lived subprocess, reaped by _terminate_child.
+    Together with apply._run_ctl (short ctl calls), no direct subprocess call
+    remains without a documented lifecycle policy."""
+
+    def test_spawns_follow_cmd_with_piped_stdout_and_no_shell(self):
+        seen = {}
+
+        def popen(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            seen["kw"] = kw
+            return "PROC"
+
+        proc = sync._spawn_follow(popen=popen)
+        self.assertEqual(proc, "PROC")
+        self.assertEqual(seen["cmd"], sync._follow_cmd())      # argv list
+        self.assertEqual(seen["kw"].get("stdout"), subprocess.PIPE)
+        self.assertNotIn("shell", seen["kw"])                  # never shell=True
+
+
 if __name__ == "__main__":
     unittest.main()
