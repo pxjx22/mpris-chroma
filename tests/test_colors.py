@@ -384,6 +384,14 @@ class ColorDataBoundsTest(unittest.TestCase):
         self.assertNotEqual(result, (DEFAULT_ACCENT,) * 3)
         self._valid_hex(result)
 
+    def test_dash_prefixed_path_is_a_file_not_an_option(self):
+        # SEC-016: pre-migration a leading-dash path could be read as an
+        # ImageMagick option; Pillow opens it as a plain file path, so the
+        # option-injection risk is structurally gone.
+        p = self.tmp / "-dash.png"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "PNG")
+        self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
 
 if __name__ == "__main__":
     unittest.main()

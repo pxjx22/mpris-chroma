@@ -218,5 +218,41 @@ class CtlReliabilityTest(unittest.TestCase):
                        run=lambda *a, **k: _Result(0))  # no raise
 
 
+class ArgSafetyTest(unittest.TestCase):
+    """SEC-016: apply_wlchroma validates every palette color at the
+    subprocess-construction boundary, so no value can smuggle an extra
+    wlchroma-ctl IPC token or line regardless of caller. Args are always a
+    shell-free argv list."""
+
+    def test_rejects_color_with_embedded_newline(self):
+        # wlchroma-ctl joins argv into one whitespace-delimited IPC line, so a
+        # newline could inject a second protocol line — refuse before building.
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("#aa0000\nset-palette evil", "#00bb00", "#0000cc",
+                           ctl="CTL", run=lambda *a, **k: _Result(0))
+
+    def test_rejects_color_with_whitespace(self):
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("#aa0000 evil", "#00bb00", "#0000cc",
+                           ctl="CTL", run=lambda *a, **k: _Result(0))
+
+    def test_rejects_non_hex_color(self):
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("red", "#00bb00", "#0000cc",
+                           ctl="CTL", run=lambda *a, **k: _Result(0))
+
+    def test_malformed_color_is_not_sent_to_ctl(self):
+        rec = Rec()
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("#aa0000 ", "#00bb00", "#0000cc", ctl="CTL", run=rec)
+        self.assertEqual(rec.calls, [])  # ctl never invoked with a bad palette
+
+    def test_valid_palette_passes_as_literal_argv(self):
+        rec = Rec()
+        apply_wlchroma("#aa0000", "#00bb00", "#0000cc", ctl="CTL", run=rec)
+        self.assertEqual(rec.calls[0][:2], ["CTL", "set-colors"])
+        self.assertIn("#aa0000", rec.calls[0])  # literal argv element, not shell
+
+
 if __name__ == "__main__":
     unittest.main()
