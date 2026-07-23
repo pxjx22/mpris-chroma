@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest import mock
 
 from mpris_chroma import apply, sync
+from mpris_chroma.state import PlayerState
 from mpris_chroma.sync import _follow_cmd, _handle_line
 
 
@@ -42,7 +43,7 @@ class HandleLineTest(unittest.TestCase):
 
     def test_stop_reverts(self):
         players, seq, applied = {}, 0, "/covers/a.jpg"
-        players["spotify"] = ("Playing", "/covers/a.jpg", 1)
+        players["spotify"] = PlayerState("Playing", "/covers/a.jpg", 1)
         with mock.patch.object(sync, "resolve_cover", return_value=None), \
              mock.patch.object(sync, "_apply_all"), \
              mock.patch.object(sync, "_revert_all") as rv:
@@ -99,7 +100,7 @@ class ApplyStateReliabilityTest(unittest.TestCase):
 
     def test_failed_revert_keeps_applied_for_retry(self):
         players, seq, applied = {}, 0, "/covers/a.jpg"
-        players["spotify"] = ("Playing", "/covers/a.jpg", 1)
+        players["spotify"] = PlayerState("Playing", "/covers/a.jpg", 1)
         with mock.patch.object(sync, "resolve_cover", return_value=None), \
              mock.patch.object(sync, "_revert_all", return_value=False) as rv:
             seq, applied = _handle_line(self._line("spotify", "Stopped", ""),

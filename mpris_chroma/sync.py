@@ -9,6 +9,7 @@ from .apply import apply_wlchroma, revert_wlchroma, CtlError
 from .colors import extract_colors
 from .cover import resolve_cover
 from .select import select
+from .state import Mode, PlayerState
 
 _log = logging.getLogger("mpris_chroma.sync")
 _log.addHandler(logging.NullHandler())
@@ -29,7 +30,7 @@ APPEARANCE_NS = "org.freedesktop.appearance"
 SCHEME_KEY = "color-scheme"
 
 
-def mode_from_color_scheme(value: int) -> str:
+def mode_from_color_scheme(value: int) -> Mode:
     """Map the portal's color-scheme value to a palette mode. Anything that
     isn't an explicit light preference (incl. 0 = no preference and future
     values) falls back to dark — the historical band."""
@@ -60,7 +61,7 @@ def _revert_all() -> bool:
         return False
 
 
-def _apply_all(cover: Path, mode: str = "dark") -> bool:
+def _apply_all(cover: Path, mode: Mode = "dark") -> bool:
     """Extract and apply the cover's palette. Returns True only if wlchroma-ctl
     confirmed the change; a bounded ctl failure is logged and returns False so
     the caller does not mark the cover applied and a later event retries."""
@@ -73,7 +74,7 @@ def _apply_all(cover: Path, mode: str = "dark") -> bool:
         return False
 
 
-def _reconcile(players: dict, applied, mode: str = "dark"):
+def _reconcile(players: dict, applied, mode: Mode = "dark"):
     """Run the selection decision over the current player states and apply,
     hold, or revert. Returns the new `applied` cover id. Shared by the stdout
     line handler and the player-vanished handler so the decision lives once.
@@ -91,7 +92,7 @@ def _reconcile(players: dict, applied, mode: str = "dark"):
     return applied
 
 
-def _handle_line(line: str, players: dict, seq: int, applied, mode: str = "dark"):
+def _handle_line(line: str, players: dict, seq: int, applied, mode: Mode = "dark"):
     """Parse one 'playerName\tstatus\tartUrl' line, update per-player state,
     then apply/hold/revert. Mutates `players` in place; returns (seq, applied)."""
     parts = line.rstrip("\n").split("\t")
@@ -102,11 +103,11 @@ def _handle_line(line: str, players: dict, seq: int, applied, mode: str = "dark"
     cover = resolve_cover(art_url, COVERS_DIRS.get(name))
     cover_id = str(cover) if cover else None
     seq += 1
-    players[name] = (status, cover_id, seq)
+    players[name] = PlayerState(status, cover_id, seq)
     return seq, _reconcile(players, applied, mode)
 
 
-def _handle_vanish(bus_name: str, players: dict, applied, mode: str = "dark"):
+def _handle_vanish(bus_name: str, players: dict, applied, mode: Mode = "dark"):
     """A D-Bus name was lost. If it was a tracked player, evict it and
     re-decide — this is what reverts to the config preset when the last
     player closes (playerctl --follow emits no line for a vanished player)."""
@@ -116,7 +117,7 @@ def _handle_vanish(bus_name: str, players: dict, applied, mode: str = "dark"):
     return _reconcile(players, applied, mode)
 
 
-def _handle_scheme_change(value: int, applied, mode: str) -> str:
+def _handle_scheme_change(value: int, applied, mode: Mode) -> Mode:
     """The portal's color-scheme changed. Returns the mode to use from now on.
 
     When a cover palette is currently applied, re-tone that same cover under
