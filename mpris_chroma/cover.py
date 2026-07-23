@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import os
 import socket
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -27,6 +28,14 @@ DOWNLOAD_TIMEOUT = 5       # per-socket-operation timeout (seconds)
 DOWNLOAD_DEADLINE = 20.0   # total-transfer deadline (seconds), independent of the socket timeout
 MAX_COVER_BYTES = 10 * 1024 * 1024  # hard cap on compressed artwork (10 MiB)
 _CHUNK = 64 * 1024
+
+# Cache-growth budget (SEC-009). Each distinct URL would otherwise leave a
+# permanent file; bound the cache by total bytes, entry count, and age, evicting
+# least-recently-used first. Generous for a laptop's playback history and far
+# below anything that fills a disk.
+CACHE_MAX_BYTES = 128 * 1024 * 1024   # total on-disk budget (128 MiB)
+CACHE_MAX_ENTRIES = 512               # total entry-count budget
+CACHE_MAX_AGE = 30 * 24 * 60 * 60     # per-entry age budget (30 days, seconds)
 
 
 class CoverError(Exception):
@@ -164,6 +173,68 @@ def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic) -> bytes:
     return b"".join(chunks)
 
 
+def _looks_like_image(data: bytes) -> bool:
+    """True only if data begins with a JPEG, PNG, or WebP signature. This is the
+    pre-publication content check (SEC-009): non-images never enter the cache.
+    It is deliberately the same format set the decoder accepts (SEC-005), but a
+    lightweight magic-byte sniff — the decoder still fully revalidates."""
+    return (data.startswith(b"\xff\xd8\xff")               # JPEG
+            or data.startswith(b"\x89PNG\r\n\x1a\n")        # PNG
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP"))  # WebP (RIFF container)
+
+
+def _publish(dest: Path, data: bytes) -> None:
+    """Atomically publish data to dest via a private, exclusive temp file in the
+    same directory, then os.replace (SEC-009).
+
+    os.replace renames onto the destination *name* atomically, so a reader never
+    sees a partial file and a crash mid-write cannot leave a published entry.
+    Because rename operates on the name and not a symlink's target, a planted
+    symlink at dest is safely replaced in place — its target is never written
+    through — rather than permanently poisoning that cache slot. The temp file
+    is removed on every failure path."""
+    fd, tmpname = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-", suffix=".img")
+    tmp = Path(tmpname)  # mkstemp creates it 0600, owned by us, exclusively
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # no partial temp survives any failure
+        raise
+
+
+def _evict(cache_dir: Path, *, now=time.time) -> None:
+    """Bound cache growth (SEC-009): remove entries past CACHE_MAX_AGE, then, if
+    still over the byte or entry-count budget, evict least-recently-used first.
+    Best-effort and race-tolerant — a file vanishing underneath us is ignored."""
+    entries = []
+    try:
+        candidates = list(cache_dir.iterdir())
+    except OSError:
+        return
+    for p in candidates:
+        if p.name.startswith(".") or p.is_symlink():
+            continue  # skip temp files and never follow/evict through symlinks
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if now() - st.st_mtime > CACHE_MAX_AGE:
+            p.unlink(missing_ok=True)
+        else:
+            entries.append((st.st_mtime, st.st_size, p))
+    entries.sort()  # oldest (least recently used) first
+    total = sum(size for _, size, _ in entries)
+    count = len(entries)
+    for _, size, p in entries:
+        if total <= CACHE_MAX_BYTES and count <= CACHE_MAX_ENTRIES:
+            break
+        p.unlink(missing_ok=True)
+        total -= size
+        count -= 1
+
+
 def _resolve_local_cover(art_url: str, root: Path | None) -> Path | None:
     """Resolve a file:// artwork URL to a regular file confined beneath root.
 
@@ -203,15 +274,19 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
         return _resolve_local_cover(art_url, covers_dir)
     elif art_url.startswith(("http://", "https://")):
         dest = _cache_path(art_url)
-        if dest.is_file():
+        # Serve only a real regular file — never a planted symlink, which
+        # is_file() would follow. A symlinked or partial entry is a miss and
+        # gets atomically replaced below.
+        if dest.is_file() and not dest.is_symlink():
             return dest
         try:
             _check_destination(art_url)
             data = _fetch(art_url)
-            if not data:
-                return None
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(data)
+            if not data or not _looks_like_image(data):
+                return None  # empty or non-image body never enters the cache
+            dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _publish(dest, data)
+            _evict(dest.parent)
         except (OSError, CoverError) as exc:
             # Expected operational failures (network via URLError/HTTPError/
             # socket timeout, filesystem, or a bounded-download rejection) are

@@ -11,6 +11,11 @@ from mpris_chroma.cover import resolve_cover
 
 _GLOBAL_ADDR = "23.192.228.84"  # a public (globally routable) address
 
+# A valid PNG *signature* plus filler. cover.py validates the signature, not
+# full decodability (the colors module decodes), so this is a sufficient stand-in
+# for "a real image" in cache tests.
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+
 
 def _resolves_to(*addrs):
     return lambda host: list(addrs)
@@ -72,16 +77,16 @@ class HttpCoverTest(unittest.TestCase):
 
     def test_http_cache_miss_downloads_and_writes(self):
         url = "https://i.scdn.co/image/abc123"
-        with mock.patch.object(cover, "_fetch", return_value=b"IMGDATA") as f:
+        with mock.patch.object(cover, "_fetch", return_value=_PNG) as f:
             p = resolve_cover(url)
         self.assertIsNotNone(p)
         self.assertTrue(p.is_file())
-        self.assertEqual(p.read_bytes(), b"IMGDATA")
+        self.assertEqual(p.read_bytes(), _PNG)
         f.assert_called_once_with(url)
 
     def test_http_cache_hit_does_not_refetch(self):
         url = "https://i.scdn.co/image/abc123"
-        with mock.patch.object(cover, "_fetch", return_value=b"IMGDATA"):
+        with mock.patch.object(cover, "_fetch", return_value=_PNG):
             first = resolve_cover(url)
         with mock.patch.object(cover, "_fetch") as f:
             second = resolve_cover(url)
@@ -102,10 +107,10 @@ class HttpCoverTest(unittest.TestCase):
         # No art, no covers_dir -> None, no crash.
         self.assertIsNone(resolve_cover(""))
 
-    def test_http_write_bytes_failure_returns_none(self):
+    def test_http_publish_failure_returns_none(self):
         url = "https://i.scdn.co/image/write-fails"
-        with mock.patch.object(cover, "_fetch", return_value=b"IMG"), \
-             mock.patch("pathlib.Path.write_bytes", side_effect=OSError("disk full")):
+        with mock.patch.object(cover, "_fetch", return_value=_PNG), \
+             mock.patch("os.replace", side_effect=OSError("disk full")):
             self.assertIsNone(resolve_cover(url))
 
 
@@ -356,6 +361,146 @@ class LocalCoverConfinementTest(unittest.TestCase):
         img = self.root / "art.jpg"
         img.write_bytes(b"x")
         self.assertIsNone(resolve_cover(f"file://{img}", None))
+
+
+class ImageSignatureTest(unittest.TestCase):
+    """SEC-009: only content whose signature is an accepted image is cached, so
+    the cache stores validated files (defense in depth; the decoder revalidates)."""
+
+    def test_accepts_known_image_signatures(self):
+        self.assertTrue(cover._looks_like_image(b"\xff\xd8\xff\xe0JFIF"))       # JPEG
+        self.assertTrue(cover._looks_like_image(b"\x89PNG\r\n\x1a\ndata"))      # PNG
+        self.assertTrue(cover._looks_like_image(b"RIFF\x00\x00\x00\x00WEBPvp"))  # WebP
+
+    def test_rejects_non_image_signatures(self):
+        for blob in [b"<html>", b"%PDF-1.4", b"GIF89a...", b"", b"just text"]:
+            self.assertFalse(cover._looks_like_image(blob), blob)
+
+
+class CachePublishTest(unittest.TestCase):
+    """SEC-009: cache writes are atomic (temp + os.replace), refuse a symlinked
+    destination, and never leave a partial file or temp behind on failure."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _temps(self):
+        return [p for p in self.cache.iterdir() if p.name.startswith(".tmp-")]
+
+    def test_publish_writes_atomically(self):
+        dest = self.cache / "abc.img"
+        cover._publish(dest, _PNG)
+        self.assertTrue(dest.is_file())
+        self.assertFalse(dest.is_symlink())
+        self.assertEqual(dest.read_bytes(), _PNG)
+        self.assertEqual(self._temps(), [])
+
+    def test_publish_failure_leaves_no_hit_or_temp(self):
+        dest = self.cache / "abc.img"
+        with mock.patch("os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                cover._publish(dest, _PNG)
+        self.assertFalse(dest.exists())
+        self.assertEqual(self._temps(), [])  # temp cleaned on failure
+
+    def test_publish_over_symlink_replaces_it_and_leaves_target_untouched(self):
+        # A planted symlink is safely replaced in place (rename acts on the
+        # name), never written through to its target.
+        target = self.cache / "target.txt"
+        target.write_bytes(b"ORIGINAL")
+        dest = self.cache / "planted.img"
+        dest.symlink_to(target)
+        cover._publish(dest, _PNG)
+        self.assertFalse(dest.is_symlink())          # link replaced by a real file
+        self.assertEqual(dest.read_bytes(), _PNG)
+        self.assertEqual(target.read_bytes(), b"ORIGINAL")  # target untouched
+        self.assertEqual(self._temps(), [])
+
+    def test_concurrent_publishes_yield_one_valid_file(self):
+        dest = self.cache / "abc.img"
+        cover._publish(dest, _PNG)
+        cover._publish(dest, _PNG + b"SECOND")  # atomic overwrite, last wins
+        self.assertTrue(dest.is_file())
+        self.assertFalse(dest.is_symlink())
+        self.assertIn(dest.read_bytes(), (_PNG, _PNG + b"SECOND"))
+        self.assertEqual(self._temps(), [])
+
+
+class CacheEvictionTest(unittest.TestCase):
+    """SEC-009: cache growth is bounded — entries past the age budget are
+    removed, and the total is held under the byte budget by evicting the
+    least-recently-used first."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_aged_entries_are_removed(self):
+        old = self.cache / "old.img"
+        old.write_bytes(_PNG)
+        new = self.cache / "new.img"
+        new.write_bytes(_PNG)
+        os.utime(old, (1, 1))  # ancient mtime
+        cover._evict(self.cache, now=lambda: 10 * cover.CACHE_MAX_AGE)
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+
+    def test_total_size_bounded_lru(self):
+        for i in range(5):
+            p = self.cache / f"f{i}.img"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([i]) * 200)  # ~208 B each
+            os.utime(p, (i + 1, i + 1))  # f0 oldest ... f4 newest
+        with mock.patch.object(cover, "CACHE_MAX_BYTES", 500):  # ~2 entries fit
+            cover._evict(self.cache, now=lambda: 1000)
+        self.assertTrue((self.cache / "f4.img").exists())   # newest kept
+        self.assertFalse((self.cache / "f0.img").exists())  # oldest evicted
+        total = sum(p.stat().st_size for p in self.cache.iterdir())
+        self.assertLessEqual(total, 500)
+
+
+class CacheSymlinkServeTest(unittest.TestCase):
+    """SEC-009: a planted symlink at a cache path is never served as a hit; a
+    fresh download replaces it in place without touching the link's target."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name)
+        self._orig = cover.CACHE_DIR
+        cover.CACHE_DIR = self.cache
+        self._dns = mock.patch.object(cover, "_resolve_host",
+                                      return_value=[_GLOBAL_ADDR])
+        self._dns.start()
+
+    def tearDown(self):
+        self._dns.stop()
+        cover.CACHE_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_symlink_entry_not_served_and_target_untouched(self):
+        url = "https://i.scdn.co/image/abc"
+        dest = cover._cache_path(url)
+        outside = self.cache / "outside.txt"
+        outside.write_bytes(b"SECRET")
+        dest.symlink_to(outside)
+        with mock.patch.object(cover, "_fetch", return_value=_PNG):
+            p = resolve_cover(url)
+        self.assertIsNotNone(p)
+        self.assertFalse(p.is_symlink())
+        self.assertEqual(p.read_bytes(), _PNG)
+        self.assertEqual(outside.read_bytes(), b"SECRET")  # target never written
+
+    def test_non_image_body_is_not_cached(self):
+        url = "https://i.scdn.co/image/x"
+        with mock.patch.object(cover, "_fetch", return_value=b"<html>nope</html>"):
+            self.assertIsNone(resolve_cover(url))
+        self.assertFalse(cover._cache_path(url).exists())
 
 
 if __name__ == "__main__":
