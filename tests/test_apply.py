@@ -1,7 +1,9 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from mpris_chroma import apply
 from mpris_chroma.apply import (
     apply_wlchroma,
     revert_wlchroma,
@@ -152,6 +154,68 @@ class RevertMalformedPaletteTest(unittest.TestCase):
             rec = Rec()
             revert_wlchroma(ctl="CTL", run=rec, config_path=cfg)
         self.assertEqual(rec.calls, [["CTL", "set-palette", "witch_hour"]])
+
+
+class _Result:
+    """Minimal stand-in for subprocess.CompletedProcess."""
+
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = stderr
+
+
+class CtlReliabilityTest(unittest.TestCase):
+    """SEC-007: every wlchroma-ctl call is time-bounded and its exit status is
+    checked, so a hung or failing ctl raises a typed CtlError instead of
+    blocking the daemon indefinitely or being silently ignored."""
+
+    def test_apply_bounds_ctl_with_a_timeout(self):
+        seen = {}
+
+        def run(cmd, **kw):
+            seen.update(kw)
+            return _Result(0)
+
+        apply_wlchroma("#aa0000", "#00bb00", "#0000bb", ctl="CTL", run=run)
+        self.assertEqual(seen.get("timeout"), apply.CTL_TIMEOUT)
+
+    def test_apply_raises_ctl_error_on_hang(self):
+        def run(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("#aa0000", "#00bb00", "#0000bb", ctl="CTL", run=run)
+
+    def test_apply_raises_ctl_error_on_nonzero_exit(self):
+        with self.assertRaises(apply.CtlError):
+            apply_wlchroma("#aa0000", "#00bb00", "#0000bb", ctl="CTL",
+                           run=lambda *a, **k: _Result(1, "socket refused"))
+
+    def test_revert_raises_ctl_error_on_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "config.toml"
+            cfg.write_text(CONFIG)
+            with self.assertRaises(apply.CtlError):
+                revert_wlchroma(ctl="CTL", config_path=cfg,
+                                run=lambda *a, **k: _Result(1, "boom"))
+
+    def test_revert_fallback_path_is_also_checked(self):
+        # The witch_hour fallback (unreadable config) must be bounded too.
+        with self.assertRaises(apply.CtlError):
+            revert_wlchroma(ctl="CTL", config_path=Path("/no/such/config.toml"),
+                            run=lambda *a, **k: _Result(1, "boom"))
+
+    def test_ctl_error_diagnostic_is_bounded(self):
+        big = "x" * 10000
+        with self.assertRaises(apply.CtlError) as cm:
+            apply_wlchroma("#aa0000", "#00bb00", "#0000bb", ctl="CTL",
+                           run=lambda *a, **k: _Result(1, big))
+        self.assertLess(len(str(cm.exception)), 1000)  # stderr excerpt bounded
+
+    def test_apply_success_does_not_raise(self):
+        apply_wlchroma("#aa0000", "#00bb00", "#0000bb", ctl="CTL",
+                       run=lambda *a, **k: _Result(0))  # no raise
 
 
 if __name__ == "__main__":

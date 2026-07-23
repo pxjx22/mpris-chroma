@@ -5,10 +5,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .apply import apply_wlchroma, revert_wlchroma
+from .apply import apply_wlchroma, revert_wlchroma, CtlError
 from .colors import extract_colors
 from .cover import resolve_cover
 from .select import select
+
+_log = logging.getLogger("mpris_chroma.sync")
+_log.addHandler(logging.NullHandler())
 
 PLAYERS = "jellyfin-tui,spotify"
 # Players with a local on-disk cover cache; others (spotify) resolve via http.
@@ -41,26 +44,46 @@ def player_name_from_bus(bus_name: str) -> str | None:
     return None
 
 
-def _revert_all():
-    revert_wlchroma()
+def _revert_all() -> bool:
+    """Revert to the config preset. Returns True only if wlchroma-ctl confirmed
+    the change; a bounded ctl failure is logged and returns False so the caller
+    leaves `applied` set and a later event retries (SEC-007)."""
+    try:
+        revert_wlchroma()
+        return True
+    except CtlError as e:
+        _log.warning("revert failed: %s", e)
+        return False
 
 
-def _apply_all(cover: Path, mode: str = "dark"):
+def _apply_all(cover: Path, mode: str = "dark") -> bool:
+    """Extract and apply the cover's palette. Returns True only if wlchroma-ctl
+    confirmed the change; a bounded ctl failure is logged and returns False so
+    the caller does not mark the cover applied and a later event retries."""
     c1, c2, c3 = extract_colors(cover, mode=mode)
-    apply_wlchroma(c1, c2, c3)
+    try:
+        apply_wlchroma(c1, c2, c3)
+        return True
+    except CtlError as e:
+        _log.warning("apply failed: %s", e)
+        return False
 
 
 def _reconcile(players: dict, applied, mode: str = "dark"):
     """Run the selection decision over the current player states and apply,
     hold, or revert. Returns the new `applied` cover id. Shared by the stdout
-    line handler and the player-vanished handler so the decision lives once."""
+    line handler and the player-vanished handler so the decision lives once.
+
+    `applied` advances only on a confirmed wlchroma change: a failed apply or
+    revert leaves it unchanged so the same work is retried on the next event
+    rather than being silently recorded as done (SEC-007)."""
     action, chosen = select(players)
     if action == "apply" and chosen != applied:
-        _apply_all(Path(chosen), mode)
-        applied = chosen
+        if _apply_all(Path(chosen), mode):
+            applied = chosen
     elif action == "revert" and applied is not None:
-        _revert_all()
-        applied = None
+        if _revert_all():
+            applied = None
     return applied
 
 

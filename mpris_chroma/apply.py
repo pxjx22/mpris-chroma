@@ -1,9 +1,13 @@
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+
+_log = logging.getLogger("mpris_chroma.apply")
+_log.addHandler(logging.NullHandler())
 
 # A palette entry is exactly '#' plus six hex digits. fullmatch (not $) is
 # deliberate: '$' would accept a trailing newline, and wlchroma-ctl joins argv
@@ -23,13 +27,40 @@ CONFIG_PATH = Path.home() / ".config/wlchroma/config.toml"
 # and snaps. A longer duration spans enough sparse callbacks to read as a glide.
 FADE_MS = 2000
 
+# wlchroma-ctl talks to a local Unix socket, so a healthy call returns almost
+# instantly. Bound it so a hung ctl (wlchroma wedged, socket unreadable) can
+# never stall a GLib callback or block shutdown until systemd's stop timeout
+# (SEC-007).
+CTL_TIMEOUT = 5   # seconds
+_MAX_DIAG = 200   # bytes of ctl stderr preserved in a CtlError message
+
+
+class CtlError(Exception):
+    """A wlchroma-ctl call timed out, failed to start, or exited non-zero."""
+
+
+def _run_ctl(cmd: list[str], *, run=subprocess.run) -> None:
+    """Run a wlchroma-ctl command bounded by CTL_TIMEOUT with its exit status
+    checked. Raises CtlError on timeout, spawn failure, or non-zero exit — with
+    a bounded stderr excerpt — so a ctl call can neither block indefinitely nor
+    have its failure silently ignored (SEC-007)."""
+    try:
+        result = run(cmd, timeout=CTL_TIMEOUT, capture_output=True, text=True)
+    except subprocess.TimeoutExpired as e:
+        raise CtlError(f"wlchroma-ctl timed out after {CTL_TIMEOUT}s") from e
+    except OSError as e:
+        raise CtlError(f"wlchroma-ctl could not run: {e}") from e
+    if result.returncode != 0:
+        err = (result.stderr or "").strip()[:_MAX_DIAG]
+        raise CtlError(f"wlchroma-ctl exited {result.returncode}: {err}")
+
 
 def apply_wlchroma(c1: str, c2: str, c3: str, *, fade_ms: int = FADE_MS,
                    ctl: str = CTL, run=subprocess.run) -> None:
     cmd = [ctl, "set-colors", c1, c2, c3]
     if fade_ms > 0:
         cmd.append(str(fade_ms))
-    run(cmd)
+    _run_ctl(cmd, run=run)
 
 
 def _valid_hex(value: object) -> str | None:
@@ -68,7 +99,8 @@ def revert_wlchroma(*, ctl: str = CTL, run=subprocess.run,
     colors = _config_palette(config_path)
     if colors is None:
         # Config gone or malformed: fall back to the named default so the
-        # daemon still reverts instead of dying mid-revert.
-        run([ctl, "set-palette", "witch_hour"])
+        # daemon still reverts instead of dying mid-revert. Bounded/checked like
+        # every other ctl call.
+        _run_ctl([ctl, "set-palette", "witch_hour"], run=run)
         return
     apply_wlchroma(*colors, fade_ms=fade_ms, ctl=ctl, run=run)
