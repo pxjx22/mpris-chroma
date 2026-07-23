@@ -2,7 +2,8 @@ import unittest
 from pathlib import Path
 
 from mpris_chroma.coordinator import Coordinator, mode_from_color_scheme
-from mpris_chroma.worker import COMMITTED, FAILED, CoverTarget, Desired, Result
+from mpris_chroma.worker import (COMMITTED, FAILED_RETRYABLE, CoverTarget,
+                                 Desired, Result)
 
 _JF_DIR = Path("/covers/jf")
 
@@ -159,10 +160,12 @@ class AdoptTest(unittest.TestCase):
         self.assertEqual(h.coord.applied, "/cache/a")
 
     def test_failed_resets_dedup_so_next_identical_line_retries(self):
-        # SEC-007 parity: a failed apply must not be deduped away next time.
+        # Interim (4c unit 2): failed still resets the dedup key so the next
+        # identical line resubmits (4b behavior). Unit 3 replaces this with a
+        # backoff timer (identical line dedups; the timer retries).
         h = _Harness()
         gen = self._apply(h)
-        h.coord.adopt(Result(gen, FAILED, None))
+        h.coord.adopt(Result(gen, FAILED_RETRYABLE, None))
         h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
         self.assertEqual(len(h.submitted), 2)  # retried, not deduped
 

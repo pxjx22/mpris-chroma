@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .select import decide
 from .state import Mode, PlayerState
-from .worker import COMMITTED, FAILED, Desired
+from .worker import COMMITTED, FAILED_RETRYABLE, REJECTED, Desired
 
 _log = logging.getLogger("mpris_chroma.coordinator")
 _log.addHandler(logging.NullHandler())
@@ -96,9 +96,10 @@ class Coordinator:
         and a stale result can never corrupt state (guarantee a)."""
         if self.stopping or result.gen != self.gen:
             return
-        if result.outcome == FAILED:
-            # Allow the next identical event to retry rather than dedup it away
-            # (SEC-007 parity): the cover was never actually applied.
+        if result.outcome in (FAILED_RETRYABLE, REJECTED):
+            # Interim (4c unit 2): keep 4b's event-driven retry — reset the dedup
+            # key so the next identical event resubmits. Unit 3 replaces this with
+            # a backoff timer for failed_retryable and no resubmission for rejected.
             self.last_submitted = None
         elif result.outcome == COMMITTED:
             self.applied = result.cover_id

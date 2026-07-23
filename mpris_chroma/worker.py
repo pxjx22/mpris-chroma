@@ -12,19 +12,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .apply import CtlError
-from .cover import CoverError
+from .cover import Ready, Rejected, Retryable
 from .state import Mode
 
 _log = logging.getLogger("mpris_chroma.worker")
 _log.addHandler(logging.NullHandler())
 
-# A job reports exactly one of these (design §2.3):
-#   committed         - resolve succeeded and ctl confirmed the change
-#   skipped_duplicate - layer-2 guard hit; no extraction, no ctl
-#   failed            - resolve returned None/raised, OR ctl raised
+# A job reports exactly one of these (SEC-018 taxonomy):
+#   committed         - resolve returned Ready and ctl confirmed the change
+#   skipped_duplicate - layer-2 (content_id, mode) guard hit; no extract, no ctl
+#   failed_retryable  - resolve returned Retryable, OR ctl raised (transient)
+#   rejected          - resolve returned Rejected (deterministic policy/content)
 COMMITTED = "committed"
 SKIPPED_DUPLICATE = "skipped_duplicate"
-FAILED = "failed"
+FAILED_RETRYABLE = "failed_retryable"
+REJECTED = "rejected"
 
 # Sentinel for "no confirmed state yet" — never equals any real (path, mode).
 _UNSET = object()
@@ -157,7 +159,7 @@ class Worker:
             result = self._run_once(item)
         except Exception:
             _log.exception("worker job (gen=%s) failed unexpectedly", gen)
-            result = Result(gen, FAILED, None)
+            result = Result(gen, FAILED_RETRYABLE, None)
         if result is not None:
             self._report(result)
 
@@ -174,26 +176,30 @@ class Worker:
             try:
                 self._revert()
             except CtlError:
-                return Result(gen, FAILED, None)
+                return Result(gen, FAILED_RETRYABLE, None)
             self._last_committed = (None, desired.mode)
             return Result(gen, COMMITTED, None)
-        try:
-            cover_id = self._resolve(desired.target.art_url, desired.target.covers_dir)
-        except CoverError:
-            return Result(gen, FAILED, None)
-        if cover_id is None:
-            return Result(gen, FAILED, None)
-        if (cover_id, desired.mode) == self._last_committed:
-            return Result(gen, SKIPPED_DUPLICATE, cover_id)
+        # resolve_cover contains its expected failures and returns a typed
+        # Resolution (SEC-018); the worker maps it, never classifies. An
+        # unexpected exception still propagates to _serve's backstop.
+        resolution = self._resolve(desired.target.art_url, desired.target.covers_dir)
+        if isinstance(resolution, Retryable):
+            return Result(gen, FAILED_RETRYABLE, None)
+        if isinstance(resolution, Rejected):
+            return Result(gen, REJECTED, None)
+        # Ready: dedup on content identity, not pathname (requirement #4).
+        key = (resolution.content_id, desired.mode)
+        if key == self._last_committed:
+            return Result(gen, SKIPPED_DUPLICATE, str(resolution.path))
         if self._mailbox.superseded(gen):
             return None  # a newer desire is waiting; drop before extract + ctl
-        c1, c2, c3 = self._extract(cover_id, desired.mode)
+        c1, c2, c3 = self._extract(resolution.path, desired.mode)
         if self._mailbox.superseded(gen):
             return None  # re-check immediately before ctl: extract is not free,
             #              so a newer desire may have arrived during it (guarantee b)
         try:
             self._apply(c1, c2, c3)
         except CtlError:
-            return Result(gen, FAILED, None)
-        self._last_committed = (cover_id, desired.mode)
-        return Result(gen, COMMITTED, cover_id)
+            return Result(gen, FAILED_RETRYABLE, None)
+        self._last_committed = key
+        return Result(gen, COMMITTED, str(resolution.path))

@@ -27,9 +27,13 @@ class HeartbeatTest(unittest.TestCase):
         gate = threading.Event()      # holds the fake fetch "in flight"
         reported = threading.Event()  # set when the worker finishes the job
 
+        from pathlib import Path
+
+        from mpris_chroma.cover import Ready
+
         def slow_resolve(art, covers_dir):
             gate.wait(2.0)            # block like a slow download (capped so no hang)
-            return "/covers/a.jpg"
+            return Ready(Path("/covers/a.jpg"), (10, 100))
 
         mb = Mailbox()
         worker = Worker(

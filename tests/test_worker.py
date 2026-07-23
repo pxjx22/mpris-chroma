@@ -1,8 +1,13 @@
 import unittest
+from pathlib import Path
 
 from mpris_chroma.apply import CtlError
-from mpris_chroma.cover import CoverError
+from mpris_chroma.cover import Ready, Rejected, Retryable
 from mpris_chroma.worker import CoverTarget, Desired, Mailbox, Worker
+
+
+def _ready(path="/covers/a.jpg", content_id=(10, 100)):
+    return Ready(Path(path), content_id)
 
 
 def _worker(**overrides):
@@ -11,7 +16,7 @@ def _worker(**overrides):
     reporting is observable without a real GLib loop."""
     calls = overrides.pop("_calls", None)
     kw = dict(
-        resolve=lambda art, covers_dir: "/covers/a.jpg",
+        resolve=lambda art, covers_dir: _ready(),
         extract=lambda path, mode: ("#aa0000", "#00bb00", "#0000cc"),
         apply=lambda c1, c2, c3: None,
         revert=lambda: None,
@@ -36,36 +41,34 @@ class WorkerRunOnceFailureTest(unittest.TestCase):
     def _apply_target(self):
         return Desired(target=CoverTarget("http://x", None), mode="dark")
 
-    def test_resolve_none_is_failed_and_skips_extract_and_apply(self):
-        # The SEC-007-class trap: an unresolved cover is a failure, not a
-        # success-with-hold — else value-dedup would suppress the retry.
+    def test_retryable_resolution_is_failed_retryable_and_skips_work(self):
         extracted, applied = [], []
         w, _ = _worker(
-            resolve=lambda a, c: None,
+            resolve=lambda a, c: Retryable("network"),
             extract=lambda p, m: extracted.append((p, m)) or ("#1", "#2", "#3"),
             apply=lambda *c: applied.append(c),
         )
         result = w._run_once((5, self._apply_target()))
-        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.outcome, "failed_retryable")
         self.assertIsNone(result.cover_id)
         self.assertEqual(extracted, [])
         self.assertEqual(applied, [])
 
-    def test_resolve_raising_cover_error_is_failed(self):
+    def test_rejected_resolution_is_rejected_and_skips_work(self):
         applied = []
-
-        def boom(a, c):
-            raise CoverError("fetch blew up")
-
-        w, _ = _worker(resolve=boom, apply=lambda *c: applied.append(c))
+        w, _ = _worker(
+            resolve=lambda a, c: Rejected("ssrf"),
+            apply=lambda *c: applied.append(c),
+        )
         result = w._run_once((5, self._apply_target()))
-        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.outcome, "rejected")
         self.assertEqual(applied, [])
 
-    def test_ctl_raising_ctl_error_is_failed(self):
+    def test_ctl_error_on_apply_is_failed_retryable(self):
+        # ctl momentarily unreachable is transient — the timer should retry it.
         w, _ = _worker(apply=lambda *c: (_ for _ in ()).throw(CtlError("ctl down")))
         result = w._run_once((5, self._apply_target()))
-        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.outcome, "failed_retryable")
 
 
 class WorkerSupersededTest(unittest.TestCase):
@@ -75,7 +78,7 @@ class WorkerSupersededTest(unittest.TestCase):
 
     def _worker_with_mailbox(self, mb, **overrides):
         kw = dict(
-            resolve=lambda a, c: "/covers/a.jpg",
+            resolve=lambda a, c: _ready(),
             extract=lambda p, m: ("#1", "#2", "#3"),
             apply=lambda *c: None,
             revert=lambda: None,
@@ -138,7 +141,7 @@ class WorkerServeTest(unittest.TestCase):
         reported = []
         mb = Mailbox()
         w = Worker(
-            mb, resolve=lambda a, c: "/covers/a.jpg",
+            mb, resolve=lambda a, c: _ready(),
             extract=lambda p, m: ("#1", "#2", "#3"),
             apply=lambda *c: None, revert=lambda: None, report=reported.append,
         )
@@ -146,16 +149,17 @@ class WorkerServeTest(unittest.TestCase):
         w._serve(self._apply(5))
         self.assertEqual(reported, [])
 
-    def test_serve_backstops_unexpected_exception_as_failed(self):
-        # A non-Cover/Ctl exception (a bug) is contained as failed and reported;
-        # the loop is not torn down.
+    def test_serve_backstops_unexpected_exception_as_failed_retryable(self):
+        # A non-Cover/Ctl exception (a bug) is contained and reported; the loop is
+        # not torn down. A bug retries (bounded by the attempt cap) then goes
+        # terminal, rather than crashing the worker.
         reported = []
         w, _ = _worker(
             report=reported.append,
             extract=lambda p, m: (_ for _ in ()).throw(RuntimeError("bug")),
         )
         w._serve(self._apply(5))
-        self.assertEqual([r.outcome for r in reported], ["failed"])
+        self.assertEqual([r.outcome for r in reported], ["failed_retryable"])
 
 
 class _FakeMailbox:
@@ -197,10 +201,10 @@ class WorkerRunOnceRevertTest(unittest.TestCase):
         self.assertEqual(reverted, [True])
         self.assertEqual(applied, [])
 
-    def test_revert_ctl_error_is_failed(self):
+    def test_revert_ctl_error_is_failed_retryable(self):
         w, _ = _worker(revert=lambda: (_ for _ in ()).throw(CtlError("ctl down")))
         result = w._run_once((5, Desired(target=None, mode="dark")))
-        self.assertEqual(result.outcome, "failed")
+        self.assertEqual(result.outcome, "failed_retryable")
 
 
 class WorkerCommitDedupTest(unittest.TestCase):
@@ -223,12 +227,27 @@ class WorkerCommitDedupTest(unittest.TestCase):
         self.assertEqual(len(applied), 1)
 
     def test_different_mode_reextracts(self):
-        # A theme flip on the same cover is NOT a duplicate: (path, mode) differs.
+        # A theme flip on the same cover is NOT a duplicate: (content_id, mode) differs.
         applied = []
         w, _ = _worker(apply=lambda *c: applied.append(c))
         w._run_once((5, Desired(CoverTarget("http://x", None), "dark")))
         r2 = w._run_once((6, Desired(CoverTarget("http://x", None), "light")))
         self.assertEqual(r2.outcome, "committed")
+        self.assertEqual(len(applied), 2)
+
+    def test_same_path_new_content_id_reextracts(self):
+        # SEC-018 identity: a file overwritten in place (same path, new mtime →
+        # new content_id) is NOT a duplicate — it re-extracts.
+        applied = []
+        ids = iter([(10, 100), (10, 200)])  # same size, new mtime_ns
+        w, _ = _worker(
+            resolve=lambda a, c: _ready("/covers/a.jpg", next(ids)),
+            apply=lambda *c: applied.append(c),
+        )
+        r1 = w._run_once(self._apply(5))
+        r2 = w._run_once(self._apply(6))
+        self.assertEqual(r1.outcome, "committed")
+        self.assertEqual(r2.outcome, "committed")  # not skipped_duplicate
         self.assertEqual(len(applied), 2)
 
     def test_repeat_revert_is_skipped_duplicate(self):

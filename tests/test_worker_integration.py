@@ -9,6 +9,9 @@ import os
 import threading
 import unittest
 
+from pathlib import Path
+
+from mpris_chroma.cover import Ready
 from mpris_chroma.worker import CoverTarget, Desired, Mailbox, Worker
 
 _ENABLED = os.environ.get("MPRIS_CHROMA_INTEGRATION")
@@ -17,7 +20,7 @@ _ENABLED = os.environ.get("MPRIS_CHROMA_INTEGRATION")
 def _worker(mb, report):
     return Worker(
         mb,
-        resolve=lambda a, c: "/covers/a.jpg",
+        resolve=lambda a, c: Ready(Path("/covers/a.jpg"), (10, 100)),
         extract=lambda p, m: ("#1", "#2", "#3"),
         apply=lambda *c: None,
         revert=lambda: None,
