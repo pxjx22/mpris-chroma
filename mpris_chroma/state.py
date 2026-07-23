@@ -12,9 +12,6 @@ when 4c actually needs them.
 from dataclasses import dataclass
 from typing import Literal
 
-# What select() decides the desktop should do.
-Action = Literal["apply", "hold", "revert"]
-
 # Palette brightness band. Hue/saturation always come from the cover; the mode
 # only remaps how bright the palette lands (see colors.BANDS).
 Mode = Literal["dark", "light"]
