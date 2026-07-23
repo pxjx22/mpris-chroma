@@ -82,7 +82,7 @@ class HttpCoverTest(unittest.TestCase):
         self.assertIsNotNone(p)
         self.assertTrue(p.is_file())
         self.assertEqual(p.read_bytes(), _PNG)
-        f.assert_called_once_with(url)
+        f.assert_called_once_with(url, should_stop=None)
 
     def test_http_cache_hit_does_not_refetch(self):
         url = "https://i.scdn.co/image/abc123"
@@ -112,6 +112,13 @@ class HttpCoverTest(unittest.TestCase):
         with mock.patch.object(cover, "_fetch", return_value=_PNG), \
              mock.patch("os.replace", side_effect=OSError("disk full")):
             self.assertIsNone(resolve_cover(url))
+
+    def test_resolve_cover_forwards_should_stop_to_fetch(self):
+        url = "https://i.scdn.co/image/abc123"
+        stop = lambda: False
+        with mock.patch.object(cover, "_fetch", return_value=_PNG) as f:
+            resolve_cover(url, should_stop=stop)
+        f.assert_called_once_with(url, should_stop=stop)
 
 
 class FakeResp:
@@ -171,6 +178,28 @@ class FetchBoundsTest(unittest.TestCase):
         data = cover._fetch("https://h/x", opener=_opener_for(resp),
                             now=lambda: 0.0)
         self.assertEqual(data, b"IMGDATA")
+
+
+class FetchAbortTest(unittest.TestCase):
+    """SEC-001 §5.1: an in-flight download aborts promptly on shutdown so a
+    stop does not hang exit for up to the download deadline."""
+
+    def test_should_stop_aborts_mid_stream(self):
+        resp = FakeResp([b"a"] * 1000)  # would drip forever
+        checks = {"n": 0}
+
+        def should_stop():
+            checks["n"] += 1
+            return checks["n"] > 1  # let the first chunk through, then abort
+
+        with self.assertRaises(cover.CoverAborted):
+            cover._fetch("https://h/x", opener=_opener_for(resp),
+                         now=lambda: 0.0, should_stop=should_stop)
+
+    def test_default_none_never_aborts(self):
+        resp = FakeResp([b"IMG", b"DATA"])
+        data = cover._fetch("https://h/x", opener=_opener_for(resp), now=lambda: 0.0)
+        self.assertEqual(data, b"IMGDATA")  # unchanged when should_stop is None
 
 
 class ResolveCoverErrorHandlingTest(unittest.TestCase):

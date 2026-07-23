@@ -54,6 +54,10 @@ class CoverRejected(CoverError):
     """A destination or local path was refused by policy (SSRF / confinement)."""
 
 
+class CoverAborted(CoverError):
+    """An in-flight download was aborted by should_stop (shutdown, SEC-001)."""
+
+
 def _cache_path(url: str) -> Path:
     return CACHE_DIR / (hashlib.sha256(url.encode()).hexdigest() + ".img")
 
@@ -140,14 +144,19 @@ class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_ValidatingRedirectHandler())
 
 
-def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic) -> bytes:
+def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic,
+           should_stop=None) -> bytes:
     """Fetch raw bytes for a URL, bounded by MAX_COVER_BYTES and DOWNLOAD_DEADLINE.
 
     The urlopen timeout bounds a single socket operation, not the whole
     transfer, so a server can drip bytes indefinitely while staying under it.
     Enforce a monotonic total deadline and a hard byte cap, streamed in chunks
     so peak memory is bounded by the cap rather than by the response size.
-    Raises CoverTooLarge / CoverTimeout; opener/now are injectable for tests.
+
+    should_stop, when given, is polled once per chunk; if it returns True the
+    download is aborted with CoverAborted so a shutdown does not wait out the
+    full deadline (SEC-001 §5.1). Raises CoverTooLarge / CoverTimeout /
+    CoverAborted; opener/now/should_stop are injectable for tests.
     """
     deadline = now() + DOWNLOAD_DEADLINE
     with opener(url, timeout=DOWNLOAD_TIMEOUT) as resp:
@@ -161,6 +170,8 @@ def _fetch(url: str, *, opener=_OPENER.open, now=time.monotonic) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
+            if should_stop is not None and should_stop():
+                raise CoverAborted("download aborted by should_stop")
             if now() > deadline:
                 raise CoverTimeout("total transfer deadline exceeded")
             chunk = resp.read(_CHUNK)
@@ -259,13 +270,17 @@ def _resolve_local_cover(art_url: str, root: Path | None) -> Path | None:
     return target
 
 
-def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
+def resolve_cover(art_url: str, covers_dir: Path | None = None, *,
+                  should_stop=None) -> Path | None:
     """Resolve the current album cover to a local image path.
 
     - file://  -> the local path if it exists.
     - http(s):// -> a cached download (fetched once per URL, then reused).
     - otherwise, if covers_dir is given, the newest regular file in it.
     Returns None on any failure; never raises.
+
+    should_stop, when given, is forwarded to the download so an in-flight fetch
+    can be aborted at shutdown (SEC-001 §5.1); its abort is contained as None.
     """
     if art_url.startswith("file://"):
         # file:// is authoritative: a confined hit or None. It does not fall
@@ -281,7 +296,7 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None) -> Path | None:
             return dest
         try:
             _check_destination(art_url)
-            data = _fetch(art_url)
+            data = _fetch(art_url, should_stop=should_stop)
             if not data or not _looks_like_image(data):
                 return None  # empty or non-image body never enters the cache
             dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
