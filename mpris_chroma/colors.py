@@ -1,8 +1,7 @@
 import colorsys
-import re
-import shutil
-import subprocess
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 S_MIN = 0.45          # saturation floor for pixels that already have a hue
 V_MIN = 0.45          # value floor: lift near-black enough to be visible
@@ -23,11 +22,13 @@ BANDS = {
     "dark": (V_MIN, V_MAX),
     "light": (0.70, 0.97),
 }
-MAGICK = shutil.which("magick") or "magick"  # ImageMagick 7 binary, from PATH
-
-# ImageMagick histogram lines look like:
-#   1234: ( 237, 28, 36) #ED1C24 srgb(237,28,36)
-_HIST_RE = re.compile(r"^\s*(\d+):\s*\(\s*(\d+),\s*(\d+),\s*(\d+)")
+# Album artwork is only ever a raster photo; SVG/PDF/HTML and other formats are
+# unnecessary and expand the decoder attack surface. Only these three formats
+# (identified by Pillow from the file's *signature*, never its extension) may be
+# decoded (SEC-005).
+_ACCEPTED_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})
+_SAMPLE = (100, 100)   # downsample target, mirrors the old `-resize 100x100`
+_QUANTIZE_COLORS = 16  # palette size, mirrors the old `-colors 16`
 
 
 def clamp_hsv(h: float, s: float, v: float,
@@ -48,19 +49,29 @@ def hex_of(h: float, s: float, v: float) -> str:
 
 
 def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]:
-    """Return [(count, (h,s,v)), ...] for a quantized version of the image."""
-    out = subprocess.run(
-        [MAGICK, str(image_path), "-resize", "100x100", "-colors", "16",
-         "-depth", "8", "-format", "%c", "histogram:info:-"],
-        capture_output=True, text=True, timeout=10, check=True,
-    ).stdout
+    """Return [(count, (h,s,v)), ...] for a quantized version of the image.
+
+    Decodes in-process with Pillow instead of shelling out to ImageMagick, and
+    only for JPEG/PNG/WebP *content* — Pillow identifies the format from the
+    file signature, so HTML mislabeled as `.jpg`, SVG, and PDF are refused
+    before any pixels are decoded and no external delegate can be invoked.
+    Unaccepted or undecodable input yields an empty histogram, which the caller
+    maps to the safe default palette (SEC-005).
+    """
+    try:
+        with Image.open(image_path) as img:
+            # `.format` is set from the signature during the lazy open, before
+            # any pixel decoding — reject unaccepted formats here, up front.
+            if img.format not in _ACCEPTED_FORMATS:
+                return []
+            sample = img.convert("RGB").resize(_SAMPLE)
+    except (OSError, UnidentifiedImageError):
+        return []
+    quantized = sample.quantize(colors=_QUANTIZE_COLORS)
+    palette = quantized.getpalette()  # flat [r, g, b, r, g, b, ...]
     result = []
-    for line in out.splitlines():
-        m = _HIST_RE.match(line)
-        if not m:
-            continue
-        count = int(m.group(1))
-        r, g, b = (int(m.group(i)) / 255 for i in (2, 3, 4))
+    for count, index in quantized.getcolors():
+        r, g, b = (palette[index * 3 + c] / 255 for c in range(3))
         result.append((count, colorsys.rgb_to_hsv(r, g, b)))
     return result
 

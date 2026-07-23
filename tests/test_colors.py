@@ -1,31 +1,39 @@
 import colorsys
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 from mpris_chroma import colors
 from mpris_chroma.colors import (
-    clamp_hsv, hex_of, extract_colors, S_MIN, V_MIN, V_MAX, NEUTRAL_S, MAGICK,
+    clamp_hsv, hex_of, extract_colors, S_MIN, V_MIN, V_MAX, NEUTRAL_S,
     BANDS, VIBRANCY_WEIGHT, VIBRANCY_MIN_POP, _vibrancy_score,
 )
 
 
+def _rgb(hexc: str) -> tuple[int, int, int]:
+    return tuple(int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+
+
 def _solid(path: Path, hexcolor: str):
-    subprocess.run([MAGICK, "-size", "64x64", f"xc:{hexcolor}", str(path)], check=True)
+    Image.new("RGB", (64, 64), _rgb(hexcolor)).save(path)
 
 
 def _halves(path: Path, left: str, right: str):
-    subprocess.run(
-        [MAGICK, "-size", "32x64", f"xc:{left}", "-size", "32x64", f"xc:{right}",
-         "+append", str(path)], check=True)
+    img = Image.new("RGB", (64, 64))
+    img.paste(Image.new("RGB", (32, 64), _rgb(left)), (0, 0))
+    img.paste(Image.new("RGB", (32, 64), _rgb(right)), (32, 0))
+    img.save(path)
 
 
 def _thirds(path: Path, a: str, b: str, c: str):
-    subprocess.run(
-        [MAGICK, "-size", "22x64", f"xc:{a}", "-size", "22x64", f"xc:{b}",
-         "-size", "20x64", f"xc:{c}", "+append", str(path)], check=True)
+    img = Image.new("RGB", (64, 64))
+    img.paste(Image.new("RGB", (22, 64), _rgb(a)), (0, 0))
+    img.paste(Image.new("RGB", (22, 64), _rgb(b)), (22, 0))
+    img.paste(Image.new("RGB", (20, 64), _rgb(c)), (44, 0))
+    img.save(path)
 
 
 def _hsv(hexc: str):
@@ -193,9 +201,9 @@ class ExtractTest(unittest.TestCase):
         # a small vivid logo owns the identity. The accent must land a slot.
         img = self.tmp / "accent.png"
         _thirds(img, "#202a33", "#332028", "#2a3320")  # drab blue/plum/olive
-        subprocess.run(
-            [MAGICK, str(img), "-size", "10x10", "xc:#ff6a00",
-             "-geometry", "+27+27", "-composite", str(img)], check=True)
+        base = Image.open(img).convert("RGB")
+        base.paste(Image.new("RGB", (10, 10), _rgb("#ff6a00")), (27, 27))
+        base.save(img)
         accent_hue = _hsv("#ff6a00")[0]
         hues = [_hsv(c)[0] for c in extract_colors(img)]
         self.assertTrue(any(abs(h - accent_hue) < 0.04 for h in hues),
@@ -208,6 +216,69 @@ class ExtractTest(unittest.TestCase):
         c1, c2, c3 = extract_colors(img)
         self.assertEqual(c1, c2)
         self.assertEqual(c2, c3)
+
+
+DEFAULT_ACCENT = "#a48ec7"  # the pathological/rejected fallback triple
+
+
+class FormatAllowlistTest(unittest.TestCase):
+    """SEC-005: only JPEG/PNG/WebP *content* (by signature, not the file
+    extension) may be decoded. Anything else — HTML mislabeled as .jpg, SVG,
+    PDF, or a truncated header — must return the safe default triple without
+    ever reaching a decoder, rather than crashing or rendering."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _assert_decoded(self, path):
+        result = extract_colors(path)
+        # A real image decodes to its own colors, never the purple fallback.
+        self.assertNotEqual(result, (DEFAULT_ACCENT,) * 3)
+        for c in result:
+            self.assertRegex(c, r"^#[0-9a-f]{6}$")
+
+    def test_accepts_png(self):
+        p = self.tmp / "cover.png"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "PNG")
+        self._assert_decoded(p)
+
+    def test_accepts_jpeg(self):
+        p = self.tmp / "cover.jpg"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "JPEG")
+        self._assert_decoded(p)
+
+    def test_accepts_webp(self):
+        p = self.tmp / "cover.webp"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "WEBP")
+        self._assert_decoded(p)
+
+    def test_rejects_html_renamed_as_jpg(self):
+        p = self.tmp / "evil.jpg"
+        p.write_bytes(b"<!DOCTYPE html>\n<html><body>not an image</body></html>")
+        self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_rejects_svg(self):
+        # ImageMagick would rasterize this via a delegate; the allowlist must not.
+        p = self.tmp / "vector.svg"
+        p.write_bytes(
+            b'<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">'
+            b'<rect width="64" height="64" fill="#e01050"/></svg>')
+        self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_rejects_pdf(self):
+        p = self.tmp / "doc.pdf"
+        p.write_bytes(b"%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF")
+        self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_rejects_truncated_png(self):
+        # Valid PNG signature, then garbage: identified as PNG but undecodable.
+        p = self.tmp / "broken.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
 
 
 if __name__ == "__main__":
