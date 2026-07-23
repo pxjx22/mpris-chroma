@@ -1,7 +1,14 @@
 import colorsys
+import logging
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
+
+# Library-style logger: a NullHandler keeps it silent unless the application
+# configures logging (sync.main does), so a cover that cannot be turned into a
+# palette is diagnosable instead of silently becoming the default accent.
+_log = logging.getLogger("mpris_chroma.colors")
+_log.addHandler(logging.NullHandler())
 
 S_MIN = 0.45          # saturation floor for pixels that already have a hue
 V_MIN = 0.45          # value floor: lift near-black enough to be visible
@@ -87,7 +94,12 @@ def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]
     quantized = sample.quantize(colors=_QUANTIZE_COLORS)
     palette = quantized.getpalette()  # flat [r, g, b, r, g, b, ...]
     result = []
-    for count, index in quantized.getcolors():
+    # getcolors() returns (count, palette_index) pairs, or None if the palette
+    # is empty — guard the None so degenerate quantizer output falls through to
+    # the caller's default rather than crashing on unpacking. getcolors only
+    # reports colors that occur, so counts are positive; palette entries are
+    # bytes, so channels are already in 0..255.
+    for count, index in (quantized.getcolors() or []):
         r, g, b = (palette[index * 3 + c] / 255 for c in range(3))
         result.append((count, colorsys.rgb_to_hsv(r, g, b)))
     return result
@@ -129,7 +141,11 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
     """
     hist = _histogram(image_path)
     if not hist:
-        # Pathological image: return the default accent three times.
+        # Rejected format, undecodable data, or a genuine no-color image: fall
+        # back to the default accent, but log it so a persistently unreadable
+        # cover is diagnosable rather than a silent, wrong-looking palette.
+        _log.warning("no extractable colors from %s; using default palette",
+                     image_path.name)
         return "#a48ec7", "#a48ec7", "#a48ec7"
 
     # Most apparent first, vibrancy-aware: coverage plus a chroma bonus, so

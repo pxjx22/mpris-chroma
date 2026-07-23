@@ -326,5 +326,64 @@ class DecodeBoundsTest(unittest.TestCase):
         self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
 
 
+class ColorDataBoundsTest(unittest.TestCase):
+    """SEC-019: the quantized color data is explicitly bounded and diagnosable.
+    A cover that yields no extractable colors must fall back to the default
+    *observably* (not silently), degenerate quantizer output must not crash
+    extraction, and CMYK / alpha-bearing covers must still produce valid sRGB
+    palettes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _valid_hex(self, colors_tuple):
+        for c in colors_tuple:
+            self.assertRegex(c, r"^#[0-9a-f]{6}$")
+
+    def test_unextractable_cover_logs_default_fallback(self):
+        # A cover with no extractable colors returns the default, but must say
+        # so on the log rather than masquerading as a valid empty image.
+        p = self.tmp / "evil.jpg"
+        p.write_bytes(b"<!DOCTYPE html><html>not an image</html>")
+        with self.assertLogs("mpris_chroma.colors", level="WARNING"):
+            result = extract_colors(p)
+        self.assertEqual(result, (DEFAULT_ACCENT,) * 3)
+
+    def test_degenerate_quantizer_output_does_not_crash(self):
+        # If the quantizer ever returns no colors (a documented Pillow API
+        # result when a palette is empty), extraction must fall back to the
+        # default, not raise while unpacking None.
+        p = self.tmp / "ok.png"
+        Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "PNG")
+
+        class _Empty:
+            def getpalette(self):
+                return []
+
+            def getcolors(self):
+                return None
+
+        with mock.patch("PIL.Image.Image.quantize", return_value=_Empty()):
+            self.assertEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+    def test_cmyk_jpeg_yields_valid_srgb_palette(self):
+        p = self.tmp / "cmyk.jpg"
+        Image.new("CMYK", (64, 64), (0, 255, 255, 0)).save(p, "JPEG")  # red-ish
+        result = extract_colors(p)
+        self.assertNotEqual(result, (DEFAULT_ACCENT,) * 3)
+        self._valid_hex(result)
+
+    def test_rgba_png_yields_valid_palette(self):
+        p = self.tmp / "rgba.png"
+        Image.new("RGBA", (64, 64), (224, 16, 80, 255)).save(p, "PNG")
+        result = extract_colors(p)
+        self.assertNotEqual(result, (DEFAULT_ACCENT,) * 3)
+        self._valid_hex(result)
+
+
 if __name__ == "__main__":
     unittest.main()
