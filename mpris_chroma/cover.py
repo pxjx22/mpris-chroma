@@ -6,6 +6,7 @@ import socket
 import tempfile
 import time
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
@@ -56,6 +57,61 @@ class CoverRejected(CoverError):
 
 class CoverAborted(CoverError):
     """An in-flight download was aborted by should_stop (shutdown, SEC-001)."""
+
+
+# --- Typed resolution outcome (4c, SEC-018) --------------------------------
+#
+# resolve_cover returns one of these instead of `Path | None`. The classification
+# of transient-vs-policy is cover-domain knowledge exported as data, so the worker
+# never interprets exceptions and the coordinator's retry logic has its input.
+# This *evolves* SEC-015's containment contract (expected failures are values, not
+# exceptions) — it does not invert it: MemoryError / programming bugs still
+# propagate to the containment net in resolve_cover.
+
+
+@dataclass(frozen=True, slots=True)
+class Ready:
+    """The cover resolved to a local file. content_id = (st_size, st_mtime_ns) so
+    an in-place overwrite (new mtime) reads as a new cover (SEC-018 identity)."""
+
+    path: Path
+    content_id: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class Retryable:
+    """A transient failure (network/timeout/abort, or a cover write lagging the
+    metadata line). The coordinator retries with capped backoff."""
+
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class Rejected:
+    """A deterministic policy/content refusal (SSRF, confinement, over-size,
+    non-image). Not retried without a metadata change."""
+
+    reason: str
+
+
+Resolution = Ready | Retryable | Rejected
+
+
+def _content_id(path: Path) -> tuple[int, int]:
+    """Stat identity of a resolved cover: (size, mtime-ns). Uniform for local and
+    remote — the remote cache object is validated pre-publish and atomically
+    replaced (SEC-009), so its stat is a sound identity too."""
+    st = path.stat()
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _classify_error(exc: BaseException) -> Resolution:
+    """Map a contained resolution error to Retryable/Rejected. Policy/content
+    refusals that the same metadata will reproduce are Rejected; transient
+    failures are Retryable."""
+    if isinstance(exc, (CoverRejected, CoverTooLarge)):
+        return Rejected(type(exc).__name__)
+    return Retryable(type(exc).__name__)
 
 
 def _cache_path(url: str) -> Path:
@@ -246,45 +302,50 @@ def _evict(cache_dir: Path, *, now=time.time) -> None:
         count -= 1
 
 
-def _resolve_local_cover(art_url: str, root: Path | None) -> Path | None:
+def _resolve_local_cover(art_url: str, root: Path | None) -> Resolution:
     """Resolve a file:// artwork URL to a regular file confined beneath root.
 
     Requires an empty or 'localhost' authority and a configured player root; the
     symlink-resolved target must be a regular file at or beneath the resolved
     root. Authority smuggling (file://host/...) and symlink escape are refused
-    (SEC-004). Returns None on any rejection."""
+    (SEC-004). Classification (4c): confinement/authority/no-root are deterministic
+    policy -> Rejected; a missing/not-yet-written file -> Retryable."""
     parts = urlparse(art_url)
     if parts.netloc not in ("", "localhost"):
-        return None
+        return Rejected("file authority not permitted")
     if root is None:
-        return None
+        return Rejected("no cover root for file://")
     try:
         real_root = root.resolve(strict=True)
+    except OSError:
+        return Retryable("cover root missing")
+    try:
         target = Path(unquote(parts.path)).resolve(strict=True)
     except OSError:
-        return None
+        return Retryable("local cover file missing")  # write may lag the metadata
     if not target.is_file():
-        return None
+        return Retryable("not a regular file")
     if target != real_root and real_root not in target.parents:
-        return None
-    return target
+        return Rejected("path outside cover root")
+    return Ready(target, _content_id(target))
 
 
 def resolve_cover(art_url: str, covers_dir: Path | None = None, *,
-                  should_stop=None) -> Path | None:
-    """Resolve the current album cover to a local image path.
+                  should_stop=None) -> Resolution:
+    """Resolve the current album cover to a typed Resolution (4c, SEC-018).
 
-    - file://  -> the local path if it exists.
+    - file://  -> confined local file (Ready) or a typed refusal.
     - http(s):// -> a cached download (fetched once per URL, then reused).
     - otherwise, if covers_dir is given, the newest regular file in it.
-    Returns None on any failure; never raises.
 
-    should_stop, when given, is forwarded to the download so an in-flight fetch
-    can be aborted at shutdown (SEC-001 §5.1); its abort is contained as None.
+    Evolves SEC-015's containment: expected failures become a typed Resolution
+    (Ready/Retryable/Rejected) rather than None; unexpected exceptions (MemoryError,
+    programming bugs) still propagate. should_stop is forwarded to the download so
+    an in-flight fetch aborts at shutdown (contained as Retryable via CoverAborted).
     """
     if art_url.startswith("file://"):
-        # file:// is authoritative: a confined hit or None. It does not fall
-        # through to the covers_dir scan, which would re-admit a symlink the
+        # file:// is authoritative: a confined hit or a typed refusal. It does not
+        # fall through to the covers_dir scan, which would re-admit a symlink the
         # confinement just rejected; that scan remains for non-URL art_urls.
         return _resolve_local_cover(art_url, covers_dir)
     elif art_url.startswith(("http://", "https://")):
@@ -293,31 +354,34 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None, *,
         # is_file() would follow. A symlinked or partial entry is a miss and
         # gets atomically replaced below.
         if dest.is_file() and not dest.is_symlink():
-            return dest
+            return Ready(dest, _content_id(dest))
         try:
             _check_destination(art_url)
             data = _fetch(art_url, should_stop=should_stop)
             if not data or not _looks_like_image(data):
-                return None  # empty or non-image body never enters the cache
+                # Empty or non-image body never enters the cache; that URL's
+                # content is not artwork, so it is a rejection, not transient.
+                return Rejected("empty or non-image body")
             dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _publish(dest, data)
             _evict(dest.parent)
         except (OSError, CoverError) as exc:
-            # Expected operational failures (network via URLError/HTTPError/
-            # socket timeout, filesystem, or a bounded-download rejection) are
-            # contained. Unexpected exceptions (MemoryError, programming bugs)
-            # deliberately propagate to the supervisor. Log only the hostname so
-            # URL userinfo/query secrets never reach the journal.
+            # Expected operational failures are contained and classified;
+            # unexpected exceptions (MemoryError, programming bugs) propagate.
+            # Log only the hostname so URL userinfo/query secrets never reach the
+            # journal.
             host = urlparse(art_url).hostname or "?"
             _log_failure(host, f"cover fetch failed for {host}: {type(exc).__name__}")
-            return None
-        return dest
+            return _classify_error(exc)
+        return Ready(dest, _content_id(dest))
 
     if covers_dir is not None:
         try:
             files = [f for f in covers_dir.iterdir() if f.is_file()]
         except (FileNotFoundError, NotADirectoryError):
-            return None
+            return Retryable("covers dir missing")  # may appear once the player writes
         if files:
-            return max(files, key=lambda f: f.stat().st_mtime)
-    return None
+            newest = max(files, key=lambda f: f.stat().st_mtime)
+            return Ready(newest, _content_id(newest))
+        return Retryable("no cover in dir yet")  # write may lag the metadata line
+    return Rejected("no art source")

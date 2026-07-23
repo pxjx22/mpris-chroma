@@ -21,6 +21,43 @@ def _resolves_to(*addrs):
     return lambda host: list(addrs)
 
 
+class ContentIdTest(unittest.TestCase):
+    """4c: content identity is (st_size, st_mtime_ns) of the resolved file, so a
+    file overwritten in place (new mtime) reads as a new cover."""
+
+    def test_content_id_is_size_and_mtime_ns(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "c.img"
+            p.write_bytes(b"hello")
+            st = p.stat()
+            self.assertEqual(cover._content_id(p), (st.st_size, st.st_mtime_ns))
+
+
+class ClassifyErrorTest(unittest.TestCase):
+    """4c boundary condition 1: which failure is transient vs policy is cover-
+    domain knowledge, exported as a typed Resolution (not raised)."""
+
+    def test_destination_rejection_is_rejected(self):
+        r = cover._classify_error(cover.CoverRejected("ssrf"))
+        self.assertIsInstance(r, cover.Rejected)
+
+    def test_too_large_is_rejected(self):
+        r = cover._classify_error(cover.CoverTooLarge("big"))
+        self.assertIsInstance(r, cover.Rejected)
+
+    def test_timeout_is_retryable(self):
+        r = cover._classify_error(cover.CoverTimeout("slow"))
+        self.assertIsInstance(r, cover.Retryable)
+
+    def test_aborted_is_retryable(self):
+        r = cover._classify_error(cover.CoverAborted("stop"))
+        self.assertIsInstance(r, cover.Retryable)
+
+    def test_oserror_is_retryable(self):
+        r = cover._classify_error(OSError("network"))
+        self.assertIsInstance(r, cover.Retryable)
+
+
 class ResolveCoverTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -34,7 +71,7 @@ class ResolveCoverTest(unittest.TestCase):
         covers.mkdir()
         img = covers / "art.jpg"
         img.write_bytes(b"x")
-        self.assertEqual(resolve_cover(f"file://{img}", covers), img.resolve())
+        self.assertEqual(resolve_cover(f"file://{img}", covers).path, img.resolve())
 
     def test_remote_url_falls_back_to_newest_cover(self):
         covers = self.tmp / "covers"
@@ -46,16 +83,16 @@ class ResolveCoverTest(unittest.TestCase):
         os.utime(old, (1, 1))
         os.utime(new, (time.time(), time.time()))
         self.assertEqual(
-            resolve_cover("jellyfin:Items/abc/Images/Primary", covers), new
+            resolve_cover("jellyfin:Items/abc/Images/Primary", covers).path, new
         )
 
-    def test_empty_covers_dir_returns_none(self):
+    def test_empty_covers_dir_is_retryable(self):
         covers = self.tmp / "covers"
         covers.mkdir()
-        self.assertIsNone(resolve_cover("", covers))
+        self.assertIsInstance(resolve_cover("", covers), cover.Retryable)
 
-    def test_missing_covers_dir_returns_none(self):
-        self.assertIsNone(resolve_cover("", self.tmp / "nope"))
+    def test_missing_covers_dir_is_retryable(self):
+        self.assertIsInstance(resolve_cover("", self.tmp / "nope"), cover.Retryable)
 
 
 class HttpCoverTest(unittest.TestCase):
@@ -78,10 +115,10 @@ class HttpCoverTest(unittest.TestCase):
     def test_http_cache_miss_downloads_and_writes(self):
         url = "https://i.scdn.co/image/abc123"
         with mock.patch.object(cover, "_fetch", return_value=_PNG) as f:
-            p = resolve_cover(url)
-        self.assertIsNotNone(p)
-        self.assertTrue(p.is_file())
-        self.assertEqual(p.read_bytes(), _PNG)
+            r = resolve_cover(url)
+        self.assertIsInstance(r, cover.Ready)
+        self.assertTrue(r.path.is_file())
+        self.assertEqual(r.path.read_bytes(), _PNG)
         f.assert_called_once_with(url, should_stop=None)
 
     def test_http_cache_hit_does_not_refetch(self):
@@ -90,28 +127,28 @@ class HttpCoverTest(unittest.TestCase):
             first = resolve_cover(url)
         with mock.patch.object(cover, "_fetch") as f:
             second = resolve_cover(url)
-        self.assertEqual(first, second)
+        self.assertEqual(first.path, second.path)
         f.assert_not_called()
 
-    def test_http_fetch_failure_returns_none(self):
+    def test_http_fetch_failure_is_retryable(self):
         url = "https://i.scdn.co/image/broken"
         with mock.patch.object(cover, "_fetch", side_effect=OSError("network")):
-            self.assertIsNone(resolve_cover(url))
+            self.assertIsInstance(resolve_cover(url), cover.Retryable)
 
-    def test_http_empty_body_returns_none(self):
+    def test_http_empty_body_is_rejected(self):
         url = "https://i.scdn.co/image/empty"
         with mock.patch.object(cover, "_fetch", return_value=b""):
-            self.assertIsNone(resolve_cover(url))
+            self.assertIsInstance(resolve_cover(url), cover.Rejected)
 
-    def test_covers_dir_defaults_to_none(self):
-        # No art, no covers_dir -> None, no crash.
-        self.assertIsNone(resolve_cover(""))
+    def test_no_art_source_is_rejected(self):
+        # No art, no covers_dir -> a deterministic rejection, no crash.
+        self.assertIsInstance(resolve_cover(""), cover.Rejected)
 
-    def test_http_publish_failure_returns_none(self):
+    def test_http_publish_failure_is_retryable(self):
         url = "https://i.scdn.co/image/write-fails"
         with mock.patch.object(cover, "_fetch", return_value=_PNG), \
              mock.patch("os.replace", side_effect=OSError("disk full")):
-            self.assertIsNone(resolve_cover(url))
+            self.assertIsInstance(resolve_cover(url), cover.Retryable)
 
     def test_resolve_cover_forwards_should_stop_to_fetch(self):
         url = "https://i.scdn.co/image/abc123"
@@ -221,9 +258,10 @@ class ResolveCoverErrorHandlingTest(unittest.TestCase):
         cover.CACHE_DIR = self._orig
         self._tmp.cleanup()
 
-    def test_cover_error_is_contained_as_none(self):
+    def test_cover_error_is_contained_as_rejected(self):
         with mock.patch.object(cover, "_fetch", side_effect=cover.CoverTooLarge("big")):
-            self.assertIsNone(resolve_cover("https://i.scdn.co/image/x"))
+            self.assertIsInstance(resolve_cover("https://i.scdn.co/image/x"),
+                                  cover.Rejected)
 
     def test_programming_error_propagates(self):
         # A TypeError is a bug, not an operational failure; it must reach the
@@ -358,38 +396,42 @@ class LocalCoverConfinementTest(unittest.TestCase):
     def test_accepts_cover_inside_root(self):
         img = self.root / "art.jpg"
         img.write_bytes(b"x")
-        self.assertEqual(resolve_cover(f"file://{img}", self.root), img.resolve())
+        self.assertEqual(resolve_cover(f"file://{img}", self.root).path, img.resolve())
 
     def test_accepts_localhost_authority(self):
         img = self.root / "art.jpg"
         img.write_bytes(b"x")
-        self.assertEqual(resolve_cover(f"file://localhost{img}", self.root),
+        self.assertEqual(resolve_cover(f"file://localhost{img}", self.root).path,
                          img.resolve())
 
     def test_rejects_path_outside_root(self):
         outside = self.base / "secret.txt"
         outside.write_bytes(b"x")
-        self.assertIsNone(resolve_cover(f"file://{outside}", self.root))
+        self.assertIsInstance(resolve_cover(f"file://{outside}", self.root),
+                              cover.Rejected)
 
     def test_rejects_etc_passwd(self):
-        self.assertIsNone(resolve_cover("file:///etc/passwd", self.root))
+        self.assertIsInstance(resolve_cover("file:///etc/passwd", self.root),
+                              cover.Rejected)
 
     def test_rejects_remote_authority(self):
         img = self.root / "art.jpg"
         img.write_bytes(b"x")
-        self.assertIsNone(resolve_cover(f"file://remote-host{img}", self.root))
+        self.assertIsInstance(resolve_cover(f"file://remote-host{img}", self.root),
+                              cover.Rejected)
 
     def test_rejects_symlink_escaping_root(self):
         outside = self.base / "secret.txt"
         outside.write_bytes(b"x")
         link = self.root / "link.jpg"
         link.symlink_to(outside)
-        self.assertIsNone(resolve_cover(f"file://{link}", self.root))
+        self.assertIsInstance(resolve_cover(f"file://{link}", self.root),
+                              cover.Rejected)
 
     def test_rejects_when_no_root_configured(self):
         img = self.root / "art.jpg"
         img.write_bytes(b"x")
-        self.assertIsNone(resolve_cover(f"file://{img}", None))
+        self.assertIsInstance(resolve_cover(f"file://{img}", None), cover.Rejected)
 
 
 class ImageSignatureTest(unittest.TestCase):
@@ -519,16 +561,16 @@ class CacheSymlinkServeTest(unittest.TestCase):
         outside.write_bytes(b"SECRET")
         dest.symlink_to(outside)
         with mock.patch.object(cover, "_fetch", return_value=_PNG):
-            p = resolve_cover(url)
-        self.assertIsNotNone(p)
-        self.assertFalse(p.is_symlink())
-        self.assertEqual(p.read_bytes(), _PNG)
+            r = resolve_cover(url)
+        self.assertIsInstance(r, cover.Ready)
+        self.assertFalse(r.path.is_symlink())
+        self.assertEqual(r.path.read_bytes(), _PNG)
         self.assertEqual(outside.read_bytes(), b"SECRET")  # target never written
 
     def test_non_image_body_is_not_cached(self):
         url = "https://i.scdn.co/image/x"
         with mock.patch.object(cover, "_fetch", return_value=b"<html>nope</html>"):
-            self.assertIsNone(resolve_cover(url))
+            self.assertIsInstance(resolve_cover(url), cover.Rejected)
         self.assertFalse(cover._cache_path(url).exists())
 
 
