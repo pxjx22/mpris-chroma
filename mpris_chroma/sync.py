@@ -19,6 +19,10 @@ COVERS_DIRS = {"jellyfin-tui": Path.home() / ".local/share/jellyfin-tui/covers"}
 
 MPRIS_PREFIX = "org.mpris.MediaPlayer2."
 
+# Seconds to wait for the playerctl child to exit on SIGTERM before escalating
+# to SIGKILL, so shutdown is bounded well under systemd's stop timeout (SEC-013).
+CHILD_STOP_TIMEOUT = 5
+
 # freedesktop settings portal: color-scheme lives in this namespace and is
 # 0 = no preference, 1 = prefer dark, 2 = prefer light.
 APPEARANCE_NS = "org.freedesktop.appearance"
@@ -127,6 +131,20 @@ def _handle_scheme_change(value: int, applied, mode: str) -> str:
     return new_mode
 
 
+def _terminate_child(proc, *, timeout: int = CHILD_STOP_TIMEOUT) -> None:
+    """Terminate the playerctl child and guarantee it is reaped within `timeout`:
+    SIGTERM, wait up to `timeout`, then SIGKILL and an unbounded reap if it
+    ignored the term. Tolerates a child that has already exited. Bounds shutdown
+    so a playerctl that ignores SIGTERM cannot hang the service until systemd's
+    stop timeout (SEC-013)."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _follow_cmd():
     """argv for the streaming multi-player playerctl watcher.
 
@@ -190,54 +208,63 @@ def main():
 
     _revert_all()  # start from a known-good default
 
+    # Enter the guaranteed-cleanup scope immediately after a successful spawn:
+    # an exception while wiring the IO channel or signal receivers below would
+    # otherwise leak the playerctl child. `channel` starts None so the finally
+    # can tell whether it was created (SEC-013).
     proc = subprocess.Popen(_follow_cmd(), stdout=subprocess.PIPE)
-    channel = GLib.IOChannel.unix_new(proc.stdout.fileno())
-    channel.set_flags(GLib.IOFlags.NONBLOCK)
+    channel = None
+    try:
+        channel = GLib.IOChannel.unix_new(proc.stdout.fileno())
+        channel.set_flags(GLib.IOFlags.NONBLOCK)
 
-    def _on_io(chan, condition):
-        nonlocal seq, applied, exit_code
-        if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
-            exit_code = 1  # playerctl died unexpectedly; let systemd restart us
+        def _on_io(chan, condition):
+            nonlocal seq, applied, exit_code
+            if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
+                exit_code = 1  # playerctl died unexpectedly; let systemd restart us
+                loop.quit()
+                return False
+            while True:
+                # read_line() -> (status, str_return, length, terminator_pos);
+                # only the status has no attribute name, so unpack positionally.
+                status, line, _length, _term = chan.read_line()
+                if status != GLib.IOStatus.NORMAL or not line:
+                    break  # AGAIN (drained) or EOF
+                seq, applied = _handle_line(line, players, seq, applied, mode)
+            return True
+
+        GLib.io_add_watch(
+            channel, GLib.PRIORITY_DEFAULT,
+            GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
+            _on_io)
+
+        def _on_name_owner_changed(name, _old_owner, new_owner):
+            nonlocal applied
+            if new_owner == "":  # a bus name was lost
+                applied = _handle_vanish(str(name), players, applied, mode)
+
+        bus.add_signal_receiver(
+            _on_name_owner_changed,
+            signal_name="NameOwnerChanged",
+            dbus_interface="org.freedesktop.DBus",
+            bus_name="org.freedesktop.DBus")
+
+        def _on_term():
+            _revert_all()
             loop.quit()
             return False
-        while True:
-            # read_line() -> (status, str_return, length, terminator_pos);
-            # only the status has no attribute name, so unpack positionally.
-            status, line, _length, _term = chan.read_line()
-            if status != GLib.IOStatus.NORMAL or not line:
-                break  # AGAIN (drained) or EOF
-            seq, applied = _handle_line(line, players, seq, applied, mode)
-        return True
 
-    GLib.io_add_watch(
-        channel, GLib.PRIORITY_DEFAULT,
-        GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
-        _on_io)
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, _on_term)
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, _on_term)
 
-    def _on_name_owner_changed(name, _old_owner, new_owner):
-        nonlocal applied
-        if new_owner == "":  # a bus name was lost
-            applied = _handle_vanish(str(name), players, applied, mode)
-
-    bus.add_signal_receiver(
-        _on_name_owner_changed,
-        signal_name="NameOwnerChanged",
-        dbus_interface="org.freedesktop.DBus",
-        bus_name="org.freedesktop.DBus")
-
-    def _on_term():
-        _revert_all()
-        loop.quit()
-        return False
-
-    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, _on_term)
-    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, _on_term)
-
-    try:
         loop.run()
     finally:
-        proc.terminate()
-        proc.wait()
+        _terminate_child(proc)      # bounded SIGTERM -> SIGKILL reap
+        if channel is not None:
+            try:
+                channel.shutdown(False)  # release the IO channel explicitly
+            except GLib.Error:
+                pass
     sys.exit(exit_code)
 
 
