@@ -188,6 +188,9 @@ class Worker:
         if self._mailbox.superseded(gen):
             return None  # a newer desire is waiting; drop before extract + ctl
         c1, c2, c3 = self._extract(cover_id, desired.mode)
+        if self._mailbox.superseded(gen):
+            return None  # re-check immediately before ctl: extract is not free,
+            #              so a newer desire may have arrived during it (guarantee b)
         try:
             self._apply(c1, c2, c3)
         except CtlError:

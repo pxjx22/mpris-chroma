@@ -102,6 +102,23 @@ class WorkerSupersededTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(reverted, [])
 
+    def test_superseded_during_extract_aborts_before_ctl(self):
+        # A newer desire that arrives WHILE extract runs (a ~100-300ms decode)
+        # must still be caught immediately before ctl — guarantee (b)'s window is
+        # extract-scale, not just resolve-scale, without the pre-ctl re-check.
+        applied = []
+        mb = Mailbox()
+
+        def extract_then_supersede(path, mode):
+            mb.put((9, Desired(CoverTarget("http://z", None), "dark")))  # newer arrives
+            return ("#1", "#2", "#3")
+
+        w = self._worker_with_mailbox(
+            mb, extract=extract_then_supersede, apply=lambda *c: applied.append(c))
+        result = w._run_once((5, Desired(CoverTarget("http://x", None), "dark")))
+        self.assertIsNone(result)
+        self.assertEqual(applied, [])
+
 
 class WorkerServeTest(unittest.TestCase):
     """_serve is one pump iteration's post-get processing: run the job, report a
