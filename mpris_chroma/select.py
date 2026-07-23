@@ -1,23 +1,35 @@
-from .state import Action, PlayerState
+from collections.abc import Callable
+from pathlib import Path
+
+from .state import Mode, PlayerState
+from .worker import CoverTarget, Desired
 
 
-def select(players: dict[str, PlayerState]) -> tuple[Action, str | None]:
-    """Pick what the desktop should show from the per-player states.
+def decide(players: dict[str, PlayerState], mode: Mode,
+           covers_dir_for: Callable[[str], Path | None]) -> Desired | None:
+    """Pick the desired end-state from the per-player states (4b, SEC-001).
 
-    players maps player name -> PlayerState(status, cover_id, seq), where seq is
-    a monotonic recency counter (higher = updated more recently).
+    Resolution now happens off-thread, so this decides from *unresolved* state —
+    status plus art_url — and returns a Desired for the worker to converge to:
 
-    - Any player Playing with a resolved cover -> apply the most-recent one.
-    - Players Playing but with no cover yet -> hold (cover may still resolve).
-    - Nothing Playing (paused, stopped, or closed) -> revert to the default
-      palette: paused music has stopped mattering to the desktop.
+    - No player Playing -> revert (Desired with target=None).
+    - Newest Playing player (by seq) with an *art source* -> apply its cover.
+    - Newest Playing player with *no* art source -> None (hold: keep the current
+      palette; there is nothing to resolve yet).
+
+    An "art source" is a non-empty art_url OR a configured covers_dir for that
+    player, so a jellyfin-tui line with empty art still resolves via its
+    directory scan rather than holding.
+
+    This drops select()'s cover-aware ranking (an older Playing-with-cover
+    outranking a newer Playing-without-cover): that needs per-player resolution
+    outcomes, which are 4c's state machine. See SECURITY_AUDIT.md SEC-018.
     """
-    playing = [(p.seq, p.cover_id) for p in players.values()
-               if p.status == "Playing"]
-    if playing:
-        with_cover = [(seq, cover) for (seq, cover) in playing if cover]
-        if with_cover:
-            _, cover = max(with_cover)
-            return "apply", cover
-        return "hold", None
-    return "revert", None
+    playing = [(name, p) for name, p in players.items() if p.status == "Playing"]
+    if not playing:
+        return Desired(target=None, mode=mode)
+    name, p = max(playing, key=lambda np: np[1].seq)
+    covers_dir = covers_dir_for(name)
+    if p.art_url or covers_dir is not None:
+        return Desired(target=CoverTarget(p.art_url, covers_dir), mode=mode)
+    return None

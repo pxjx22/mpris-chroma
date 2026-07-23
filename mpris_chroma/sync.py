@@ -3,13 +3,14 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from .apply import apply_wlchroma, revert_wlchroma, CtlError
+from .apply import CtlError, apply_wlchroma, revert_wlchroma
 from .colors import extract_colors
+from .coordinator import Coordinator, mode_from_color_scheme
 from .cover import resolve_cover
-from .select import select
-from .state import Mode, PlayerState
+from .worker import Mailbox, Worker
 
 _log = logging.getLogger("mpris_chroma.sync")
 _log.addHandler(logging.NullHandler())
@@ -18,11 +19,14 @@ PLAYERS = "jellyfin-tui,spotify"
 # Players with a local on-disk cover cache; others (spotify) resolve via http.
 COVERS_DIRS = {"jellyfin-tui": Path.home() / ".local/share/jellyfin-tui/covers"}
 
-MPRIS_PREFIX = "org.mpris.MediaPlayer2."
-
 # Seconds to wait for the playerctl child to exit on SIGTERM before escalating
 # to SIGKILL, so shutdown is bounded well under systemd's stop timeout (SEC-013).
 CHILD_STOP_TIMEOUT = 5
+
+# Bound on joining the palette worker at shutdown (SEC-001 §5). Worst case is an
+# abortable download stage (~one socket op once should_stop fires) plus one ctl
+# call — far under systemd's 90 s TimeoutStopSec.
+WORKER_STOP_TIMEOUT = 10
 
 # freedesktop settings portal: color-scheme lives in this namespace and is
 # 0 = no preference, 1 = prefer dark, 2 = prefer light.
@@ -30,114 +34,10 @@ APPEARANCE_NS = "org.freedesktop.appearance"
 SCHEME_KEY = "color-scheme"
 
 
-def mode_from_color_scheme(value: int) -> Mode:
-    """Map the portal's color-scheme value to a palette mode. Anything that
-    isn't an explicit light preference (incl. 0 = no preference and future
-    values) falls back to dark — the historical band."""
-    return "light" if value == 2 else "dark"
-
-
-def player_name_from_bus(bus_name: str) -> str | None:
-    """Map a D-Bus name to playerctl's {{playerName}}, or None if not a player.
-
-    playerctl keys players by the bus name minus the MPRIS prefix (instance
-    suffix included), so this is exactly the key used in the `players` dict —
-    letting a NameOwnerChanged vanish evict the matching entry.
-    """
-    if bus_name.startswith(MPRIS_PREFIX):
-        return bus_name[len(MPRIS_PREFIX):]
-    return None
-
-
-def _revert_all() -> bool:
-    """Revert to the config preset. Returns True only if wlchroma-ctl confirmed
-    the change; a bounded ctl failure is logged and returns False so the caller
-    leaves `applied` set and a later event retries (SEC-007)."""
-    try:
-        revert_wlchroma()
-        return True
-    except CtlError as e:
-        _log.warning("revert failed: %s", e)
-        return False
-
-
-def _apply_all(cover: Path, mode: Mode = "dark") -> bool:
-    """Extract and apply the cover's palette. Returns True only if wlchroma-ctl
-    confirmed the change; a bounded ctl failure is logged and returns False so
-    the caller does not mark the cover applied and a later event retries."""
-    c1, c2, c3 = extract_colors(cover, mode=mode)
-    try:
-        apply_wlchroma(c1, c2, c3)
-        return True
-    except CtlError as e:
-        _log.warning("apply failed: %s", e)
-        return False
-
-
-def _reconcile(players: dict, applied, mode: Mode = "dark"):
-    """Run the selection decision over the current player states and apply,
-    hold, or revert. Returns the new `applied` cover id. Shared by the stdout
-    line handler and the player-vanished handler so the decision lives once.
-
-    `applied` advances only on a confirmed wlchroma change: a failed apply or
-    revert leaves it unchanged so the same work is retried on the next event
-    rather than being silently recorded as done (SEC-007)."""
-    action, chosen = select(players)
-    if action == "apply" and chosen != applied:
-        if _apply_all(Path(chosen), mode):
-            applied = chosen
-    elif action == "revert" and applied is not None:
-        if _revert_all():
-            applied = None
-    return applied
-
-
-def _handle_line(line: str, players: dict, seq: int, applied, mode: Mode = "dark"):
-    """Parse one 'playerName\tstatus\tartUrl' line, update per-player state,
-    then apply/hold/revert. Mutates `players` in place; returns (seq, applied)."""
-    parts = line.rstrip("\n").split("\t")
-    if len(parts) < 2:
-        return seq, applied
-    name, status = parts[0], parts[1]
-    art_url = parts[2] if len(parts) > 2 else ""
-    cover = resolve_cover(art_url, COVERS_DIRS.get(name))
-    cover_id = str(cover) if cover else None
-    seq += 1
-    players[name] = PlayerState(status, cover_id, seq)
-    return seq, _reconcile(players, applied, mode)
-
-
-def _handle_vanish(bus_name: str, players: dict, applied, mode: Mode = "dark"):
-    """A D-Bus name was lost. If it was a tracked player, evict it and
-    re-decide — this is what reverts to the config preset when the last
-    player closes (playerctl --follow emits no line for a vanished player)."""
-    name = player_name_from_bus(bus_name)
-    if name is None or players.pop(name, None) is None:
-        return applied
-    return _reconcile(players, applied, mode)
-
-
-def _handle_scheme_change(value: int, applied, mode: Mode) -> Mode:
-    """The portal's color-scheme changed. Returns the mode to use from now on.
-
-    When a cover palette is currently applied, re-tone that same cover under
-    the new band (same hues, shifted brightness). When we're reverted to
-    wlchroma's config preset, that palette isn't ours to re-tone — just track
-    the mode for the next apply."""
-    new_mode = mode_from_color_scheme(value)
-    if new_mode == mode:
-        return mode
-    if applied is not None:
-        _apply_all(Path(applied), new_mode)
-    return new_mode
-
-
-# Subprocess policy (PY-002). After the Pillow migration the daemon has exactly
-# two kinds of subprocess, each with one documented lifecycle helper:
-#   * short wlchroma-ctl calls  -> apply._run_ctl (bounded by CTL_TIMEOUT,
-#     exit-status checked, stderr excerpt captured);
-#   * the one long-lived playerctl watcher -> _spawn_follow below, reaped by
-#     _terminate_child. Both use argv lists; nothing uses shell=True.
+# Subprocess policy (PY-002). The daemon has exactly two kinds of subprocess:
+# short wlchroma-ctl calls (apply._run_ctl, now driven only from the worker) and
+# the one long-lived playerctl watcher spawned here and reaped by
+# _terminate_child. Both use argv lists; nothing uses shell=True.
 
 
 def _spawn_follow(*, popen=subprocess.Popen):
@@ -152,8 +52,7 @@ def _terminate_child(proc, *, timeout: int = CHILD_STOP_TIMEOUT) -> None:
     """Terminate the playerctl child and guarantee it is reaped within `timeout`:
     SIGTERM, wait up to `timeout`, then SIGKILL and an unbounded reap if it
     ignored the term. Tolerates a child that has already exited. Bounds shutdown
-    so a playerctl that ignores SIGTERM cannot hang the service until systemd's
-    stop timeout (SEC-013)."""
+    so a playerctl that ignores SIGTERM cannot hang the service (SEC-013)."""
     proc.terminate()
     try:
         proc.wait(timeout=timeout)
@@ -175,32 +74,38 @@ def _follow_cmd():
     ]
 
 
+def _bounded_revert() -> None:
+    """Revert to the config preset directly, containing a ctl failure. Used at
+    startup (loop not running yet) and once more at shutdown after the worker is
+    stopped, where a bounded ctl call on the main thread is fine (SEC-001 §5)."""
+    try:
+        revert_wlchroma()
+    except CtlError as e:
+        _log.warning("revert failed: %s", e)
+
+
 def main():
-    # Event-driven under a GLib loop: playerctl stdout drives status/cover
-    # changes, and D-Bus NameOwnerChanged drives player-vanished reverts —
-    # playerctl --follow emits no line when a player closes, so a stdout-only
-    # loop can never notice the last player disappearing.
+    # Event-driven under a GLib loop. All blocking work (download, decode, ctl)
+    # runs on a single worker thread; GLib callbacks only parse, update state,
+    # and schedule (SEC-001). playerctl stdout drives status/cover changes, and
+    # D-Bus NameOwnerChanged drives player-vanished reverts.
     import dbus
     from dbus.mainloop.glib import DBusGMainLoop
     from gi.repository import GLib, GLibUnix
 
-    # Surface contained cover failures (SEC-015) in the journal. Without an app
-    # handler the library logger's NullHandler keeps them silent.
+    # Surface contained worker/cover failures (SEC-015) in the journal.
     logging.basicConfig(level=logging.WARNING)
 
     DBusGMainLoop(set_as_default=True)
     loop = GLib.MainLoop()
-
-    players: dict = {}
-    seq = 0
-    applied = None
-    exit_code = 0
     bus = dbus.SessionBus()
+    exit_code = 0
 
-    # Palette mode: MPRIS_CHROMA_MODE=light|dark forces it; otherwise follow
-    # the desktop's color-scheme via the freedesktop settings portal, live.
+    # Palette mode: MPRIS_CHROMA_MODE=light|dark forces it; otherwise follow the
+    # desktop's color-scheme via the freedesktop settings portal, live.
     forced_mode = os.environ.get("MPRIS_CHROMA_MODE", "").lower()
-    if forced_mode in ("light", "dark"):
+    follow_scheme = forced_mode not in ("light", "dark")
+    if not follow_scheme:
         mode = forced_mode
     else:
         mode = "dark"
@@ -213,22 +118,42 @@ def main():
         except dbus.DBusException:
             pass  # no portal (headless/odd session): stay dark
 
-        def _on_setting_changed(namespace, key, value):
-            nonlocal mode, applied
-            if str(namespace) == APPEARANCE_NS and str(key) == SCHEME_KEY:
-                mode = _handle_scheme_change(int(value), applied, mode)
+    # Start from a known-good default, inline (the loop is not running yet, so
+    # there is nothing to starve). The worker is seeded with (None, mode) so this
+    # established state is not redundantly re-applied by the first revert job.
+    _bounded_revert()
 
-        bus.add_signal_receiver(
-            _on_setting_changed,
-            signal_name="SettingChanged",
-            dbus_interface="org.freedesktop.portal.Settings")
+    mailbox = Mailbox()
+    coordinator = Coordinator(submit=mailbox.put, covers_dir_for=COVERS_DIRS.get,
+                              mode=mode)
 
-    _revert_all()  # start from a known-good default
+    # Shutdown flips this; the worker's resolve stage polls it so an in-flight
+    # download aborts promptly instead of waiting out the transfer deadline.
+    stopping = threading.Event()
 
-    # Enter the guaranteed-cleanup scope immediately after a successful spawn:
-    # an exception while wiring the IO channel or signal receivers below would
-    # otherwise leak the playerctl child. `channel` starts None so the finally
-    # can tell whether it was created (SEC-013).
+    def _post(result):
+        # Marshal a worker result to the main thread; return False so the idle
+        # source is one-shot (design §2.3 "report without removing GLib sources").
+        def _cb():
+            coordinator.adopt(result)
+            return False
+        GLib.idle_add(_cb)
+
+    worker = Worker(
+        mailbox,
+        resolve=lambda art, cd: resolve_cover(art, cd, should_stop=stopping.is_set),
+        extract=extract_colors,
+        apply=apply_wlchroma,
+        revert=revert_wlchroma,
+        report=_post,
+        initial_committed=(None, mode),
+    )
+    worker.start()
+
+    # Enter the guaranteed-cleanup scope immediately after a successful spawn: an
+    # exception while wiring the IO channel or receivers below would otherwise
+    # leak the playerctl child. `channel` starts None so the finally can tell
+    # whether it was created (SEC-013).
     proc = _spawn_follow()
     channel = None
     try:
@@ -236,18 +161,16 @@ def main():
         channel.set_flags(GLib.IOFlags.NONBLOCK)
 
         def _on_io(chan, condition):
-            nonlocal seq, applied, exit_code
+            nonlocal exit_code
             if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
                 exit_code = 1  # playerctl died unexpectedly; let systemd restart us
                 loop.quit()
                 return False
             while True:
-                # read_line() -> (status, str_return, length, terminator_pos);
-                # only the status has no attribute name, so unpack positionally.
                 status, line, _length, _term = chan.read_line()
                 if status != GLib.IOStatus.NORMAL or not line:
                     break  # AGAIN (drained) or EOF
-                seq, applied = _handle_line(line, players, seq, applied, mode)
+                coordinator.on_line(line)
             return True
 
         GLib.io_add_watch(
@@ -256,9 +179,8 @@ def main():
             _on_io)
 
         def _on_name_owner_changed(name, _old_owner, new_owner):
-            nonlocal applied
             if new_owner == "":  # a bus name was lost
-                applied = _handle_vanish(str(name), players, applied, mode)
+                coordinator.on_vanish(str(name))
 
         bus.add_signal_receiver(
             _on_name_owner_changed,
@@ -266,8 +188,27 @@ def main():
             dbus_interface="org.freedesktop.DBus",
             bus_name="org.freedesktop.DBus")
 
+        if follow_scheme:
+            def _on_setting_changed(namespace, key, value):
+                if str(namespace) == APPEARANCE_NS and str(key) == SCHEME_KEY:
+                    coordinator.on_scheme(int(value))
+
+            bus.add_signal_receiver(
+                _on_setting_changed,
+                signal_name="SettingChanged",
+                dbus_interface="org.freedesktop.portal.Settings")
+
         def _on_term():
-            _revert_all()
+            # Sequenced shutdown (design §5): stop scheduling and invalidate
+            # in-flight results, drain the mailbox, abort an in-flight download,
+            # join the worker, then do the final revert with the worker stopped
+            # so no in-flight ctl can commit after it.
+            coordinator.begin_shutdown()
+            mailbox.clear()
+            stopping.set()
+            if not worker.stop_and_join(WORKER_STOP_TIMEOUT):
+                _log.warning("worker did not stop within %ss", WORKER_STOP_TIMEOUT)
+            _bounded_revert()
             loop.quit()
             return False
 
@@ -276,10 +217,15 @@ def main():
 
         loop.run()
     finally:
-        _terminate_child(proc)      # bounded SIGTERM -> SIGKILL reap
+        # Reached by both the graceful path (above, worker already stopped) and
+        # the HUP path (exit_code=1, no deliberate revert — we exit non-zero for
+        # systemd to restart us). stop_and_join is idempotent.
+        stopping.set()
+        worker.stop_and_join(WORKER_STOP_TIMEOUT)
+        _terminate_child(proc)
         if channel is not None:
             try:
-                channel.shutdown(False)  # release the IO channel explicitly
+                channel.shutdown(False)
             except GLib.Error:
                 pass
     sys.exit(exit_code)

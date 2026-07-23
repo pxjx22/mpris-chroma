@@ -1,10 +1,12 @@
 """Typed state model for the sync daemon (PY-001).
 
 A named, immutable record for per-player state, plus the small type aliases the
-selection and palette-mode logic speak in. This is the foundation the async
-event pipeline builds on: generation tokens, a resolved-cover state machine, and
-retry bookkeeping will land here as later findings need them, but only when they
-are actually used — today it holds exactly the three fields in use.
+selection and palette-mode logic speak in. Since 4b (SEC-001), the daemon tracks
+each player's *unresolved* art_url and resolves off-thread; the generation token
+that orders that async work is coordinator-scoped (a vanish of one player can
+invalidate a job scheduled for another), so it lives on the Coordinator, not
+here. A resolved-cover state machine and retry bookkeeping land in state only
+when 4c actually needs them.
 """
 
 from dataclasses import dataclass
@@ -26,6 +28,6 @@ class PlayerState:
     place — which is exactly how the line handler reassigns `players[name]`.
     """
 
-    status: str            # MPRIS status: "Playing" / "Paused" / "Stopped"
-    cover_id: str | None   # resolved cover path/id, or None if unresolved
-    seq: int               # monotonic recency counter (higher = more recent)
+    status: str   # MPRIS status: "Playing" / "Paused" / "Stopped"
+    art_url: str  # the player's mpris:artUrl (unresolved); "" if none reported
+    seq: int      # monotonic recency counter (higher = more recent)

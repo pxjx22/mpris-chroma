@@ -1,10 +1,17 @@
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from mpris_chroma import apply, sync
+from mpris_chroma.select import decide
 from mpris_chroma.state import PlayerState
-from mpris_chroma.sync import _follow_cmd, _handle_line
+from mpris_chroma.sync import _follow_cmd
+from mpris_chroma.worker import CoverTarget, Desired
+
+_JF_DIR = Path("/covers/jf")
+
+
+def _covers_dir_for(name):
+    """Only jellyfin-tui has a local cover directory (as in production)."""
+    return _JF_DIR if name == "jellyfin-tui" else None
 
 
 class FollowCmdTest(unittest.TestCase):
@@ -22,103 +29,67 @@ class FollowCmdTest(unittest.TestCase):
         self.assertLess(cmd.index("metadata"), cmd.index("--format"))
 
 
-class HandleLineTest(unittest.TestCase):
-    def _line(self, name, status, art):
-        return f"{name}\t{status}\t{art}\n"
+class DecideTest(unittest.TestCase):
+    """decide() replaces select(): it picks a desired end-state from unresolved
+    player state (status + art_url), since resolution now happens off-thread.
+    The cover-aware ranking select() had ('older Playing-with-cover outranks a
+    newer Playing-without') is intentionally dropped here and deferred to 4c —
+    see SECURITY_AUDIT.md SEC-018."""
 
-    def test_playing_applies_and_dedupes(self):
-        players, seq, applied = {}, 0, None
-        with mock.patch.object(sync, "resolve_cover", return_value="/covers/a.jpg"), \
-             mock.patch.object(sync, "_apply_all") as ap, \
-             mock.patch.object(sync, "_revert_all") as rv:
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-            self.assertEqual(applied, "/covers/a.jpg")
-            ap.assert_called_once()
-            # same cover again -> no re-apply
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-            self.assertEqual(ap.call_count, 1)
-            rv.assert_not_called()
+    def d(self, players, mode="dark"):
+        return decide(players, mode, _covers_dir_for)
 
-    def test_stop_reverts(self):
-        players, seq, applied = {}, 0, "/covers/a.jpg"
-        players["spotify"] = PlayerState("Playing", "/covers/a.jpg", 1)
-        with mock.patch.object(sync, "resolve_cover", return_value=None), \
-             mock.patch.object(sync, "_apply_all"), \
-             mock.patch.object(sync, "_revert_all") as rv:
-            seq, applied = _handle_line(self._line("spotify", "Stopped", ""),
-                                        players, seq, applied)
-            rv.assert_called_once()
-            self.assertIsNone(applied)
+    def test_single_playing_with_art_applies_that_cover(self):
+        players = {"spotify": PlayerState("Playing", "https://x/a", 1)}
+        self.assertEqual(self.d(players),
+                         Desired(CoverTarget("https://x/a", None), "dark"))
 
-    def test_ignores_malformed_line(self):
-        players, seq, applied = {}, 0, None
-        with mock.patch.object(sync, "_apply_all") as ap, \
-             mock.patch.object(sync, "_revert_all") as rv:
-            seq, applied = _handle_line("garbage\n", players, seq, applied)
-            ap.assert_not_called()
-            rv.assert_not_called()
-            self.assertIsNone(applied)
+    def test_two_playing_most_recent_seq_wins(self):
+        players = {
+            "spotify": PlayerState("Playing", "https://x/s", 2),
+            "jellyfin-tui": PlayerState("Playing", "https://x/j", 1),
+        }
+        self.assertEqual(self.d(players),
+                         Desired(CoverTarget("https://x/s", None), "dark"))
 
+    def test_paused_and_playing_switches_to_playing(self):
+        players = {
+            "spotify": PlayerState("Paused", "https://x/s", 3),
+            "jellyfin-tui": PlayerState("Playing", "https://x/j", 2),
+        }
+        self.assertEqual(self.d(players),
+                         Desired(CoverTarget("https://x/j", _JF_DIR), "dark"))
 
-class ApplyStateReliabilityTest(unittest.TestCase):
-    """SEC-007: `applied` advances only on a confirmed wlchroma change. A failed
-    apply leaves it unchanged so the next event retries the same cover; a failed
-    revert leaves it set so a later event retries the revert. `_apply_all` /
-    `_revert_all` contain a CtlError as a False result rather than propagating."""
+    def test_all_paused_reverts(self):
+        players = {
+            "spotify": PlayerState("Paused", "https://x/s", 2),
+            "jellyfin-tui": PlayerState("Paused", "https://x/j", 1),
+        }
+        self.assertEqual(self.d(players), Desired(None, "dark"))
 
-    def _line(self, name, status, art):
-        return f"{name}\t{status}\t{art}\n"
+    def test_all_stopped_reverts(self):
+        players = {"spotify": PlayerState("Stopped", "", 4)}
+        self.assertEqual(self.d(players), Desired(None, "dark"))
 
-    def test_failed_apply_does_not_advance_applied(self):
-        players, seq, applied = {}, 0, None
-        with mock.patch.object(sync, "resolve_cover", return_value="/covers/a.jpg"), \
-             mock.patch.object(sync, "_apply_all", return_value=False) as ap:
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-        ap.assert_called_once()
-        self.assertIsNone(applied)  # not advanced on failure
+    def test_empty_reverts(self):
+        self.assertEqual(self.d({}), Desired(None, "dark"))
 
-    def test_same_cover_retried_after_failed_apply(self):
-        players, seq, applied = {}, 0, None
-        with mock.patch.object(sync, "resolve_cover", return_value="/covers/a.jpg"), \
-             mock.patch.object(sync, "_apply_all", return_value=False) as ap:
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-        self.assertEqual(ap.call_count, 2)  # retried, not deduped as "applied"
+    def test_playing_without_art_source_holds(self):
+        # spotify has no covers_dir and no art_url -> no source -> hold (None).
+        players = {"spotify": PlayerState("Playing", "", 5)}
+        self.assertIsNone(self.d(players))
 
-    def test_applied_advances_after_successful_apply(self):
-        players, seq, applied = {}, 0, None
-        with mock.patch.object(sync, "resolve_cover", return_value="/covers/a.jpg"), \
-             mock.patch.object(sync, "_apply_all", return_value=True):
-            seq, applied = _handle_line(self._line("spotify", "Playing", "http://x"),
-                                        players, seq, applied)
-        self.assertEqual(applied, "/covers/a.jpg")
+    def test_playing_jellyfin_empty_art_still_resolves_via_dir(self):
+        # jellyfin-tui empty art but a covers_dir IS configured -> dir-scan
+        # source, so it is an apply target, not a hold (design §4).
+        players = {"jellyfin-tui": PlayerState("Playing", "", 5)}
+        self.assertEqual(self.d(players),
+                         Desired(CoverTarget("", _JF_DIR), "dark"))
 
-    def test_failed_revert_keeps_applied_for_retry(self):
-        players, seq, applied = {}, 0, "/covers/a.jpg"
-        players["spotify"] = PlayerState("Playing", "/covers/a.jpg", 1)
-        with mock.patch.object(sync, "resolve_cover", return_value=None), \
-             mock.patch.object(sync, "_revert_all", return_value=False) as rv:
-            seq, applied = _handle_line(self._line("spotify", "Stopped", ""),
-                                        players, seq, applied)
-        rv.assert_called_once()
-        self.assertEqual(applied, "/covers/a.jpg")  # kept so revert can retry
-
-    def test_apply_all_contains_ctl_error_as_false(self):
-        with mock.patch.object(sync, "extract_colors",
-                               return_value=("#aa0000", "#00bb00", "#0000cc")), \
-             mock.patch.object(sync, "apply_wlchroma",
-                               side_effect=apply.CtlError("ctl down")):
-            self.assertFalse(sync._apply_all(Path("/covers/a.jpg"), "dark"))
-
-    def test_revert_all_contains_ctl_error_as_false(self):
-        with mock.patch.object(sync, "revert_wlchroma",
-                               side_effect=apply.CtlError("ctl down")):
-            self.assertFalse(sync._revert_all())
+    def test_mode_is_carried_into_the_desired(self):
+        players = {"spotify": PlayerState("Playing", "https://x/a", 1)}
+        self.assertEqual(self.d(players, mode="light"),
+                         Desired(CoverTarget("https://x/a", None), "light"))
 
 
 if __name__ == "__main__":

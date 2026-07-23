@@ -1,6 +1,6 @@
 import unittest
 
-from mpris_chroma.sync import player_name_from_bus
+from mpris_chroma.coordinator import player_name_from_bus
 
 
 class BusNameTest(unittest.TestCase):
