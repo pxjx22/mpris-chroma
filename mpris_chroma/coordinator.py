@@ -9,6 +9,7 @@ impossible (design guarantee a).
 """
 
 import logging
+import random
 from collections.abc import Callable
 from pathlib import Path
 
@@ -20,6 +21,25 @@ _log = logging.getLogger("mpris_chroma.coordinator")
 _log.addHandler(logging.NullHandler())
 
 MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+
+# Retry backoff (SEC-018): capped exponential with jitter, then terminal. Three
+# attempts at 1s/2s/4s ≈ 7s total, so a genuinely-absent cover (e.g. a player
+# with covers disabled) burns a bounded window before going quiet.
+RETRY_BASE_MS = 1000
+RETRY_CAP_MS = 30_000
+RETRY_MAX_ATTEMPTS = 3
+RETRY_JITTER = 0.15
+
+
+def _default_jitter() -> float:
+    """Production jitter multiplier in [1-J, 1+J]; injectable in tests."""
+    return random.uniform(1 - RETRY_JITTER, 1 + RETRY_JITTER)
+
+
+def backoff_delay_ms(attempt: int, jitter: Callable[[], float]) -> int:
+    """Delay before retry `attempt` (1-based): min(BASE * 2^(n-1), CAP) * jitter.
+    Pure given the injected jitter, so the math is unit-testable exactly."""
+    return int(min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_CAP_MS) * jitter())
 
 
 def mode_from_color_scheme(value: int) -> Mode:
@@ -43,17 +63,30 @@ class Coordinator:
     jobs. All methods run on the GLib main thread."""
 
     def __init__(self, *, submit: Callable[[tuple[int, Desired]], None],
-                 covers_dir_for: Callable[[str], Path | None], mode: Mode = "dark"):
+                 covers_dir_for: Callable[[str], Path | None], mode: Mode = "dark",
+                 schedule: Callable[[int, Callable[[], None]], object],
+                 cancel: Callable[[object], None],
+                 jitter: Callable[[], float] = _default_jitter):
         self.players: dict[str, PlayerState] = {}
         self.seq = 0
         self.gen = 0
         self.mode: Mode = mode
         self.applied: str | None = None      # bookkeeping/observability only
         self.last_desired: Desired | None = None   # last decided (retone target)
-        self.last_submitted: Desired | None = None  # dedup key; reset on failure
+        self.last_submitted: Desired | None = None  # dedup key
         self.stopping = False
         self._submit = submit
         self._covers_dir_for = covers_dir_for
+        # Retry timer plumbing (SEC-018). schedule/cancel are injected so this
+        # module stays GLib-free: sync.py wires GLib.timeout_add (one-shot) and
+        # GLib.source_remove. Winner-only retry means at most ONE armed timer
+        # exists at any time, so retry state is three scalars, not a map.
+        self._schedule = schedule
+        self._cancel = cancel
+        self._jitter = jitter
+        self._retry_handle: object | None = None   # armed GLib source, if any
+        self._retry_desire: Desired | None = None  # desire the attempts count against
+        self._retry_attempt = 0
 
     # --- GLib-driven event handlers (main thread) ---------------------------
 
@@ -96,21 +129,27 @@ class Coordinator:
         and a stale result can never corrupt state (guarantee a)."""
         if self.stopping or result.gen != self.gen:
             return
-        if result.outcome in (FAILED_RETRYABLE, REJECTED):
-            # Interim (4c unit 2): keep 4b's event-driven retry — reset the dedup
-            # key so the next identical event resubmits. Unit 3 replaces this with
-            # a backoff timer for failed_retryable and no resubmission for rejected.
-            self.last_submitted = None
+        if result.outcome == FAILED_RETRYABLE:
+            # §4.1 redefinition of the 4b failure-reset: the dedup key stays set
+            # (an identical line dedups) and the backoff timer owns resubmission,
+            # so recovery no longer depends on unrelated MPRIS events.
+            self._arm_retry()
+        elif result.outcome == REJECTED:
+            # Terminal without a metadata change: no timer, and the kept dedup
+            # key means repeats of the same line cannot spin.
+            pass
         elif result.outcome == COMMITTED:
             self.applied = result.cover_id
+            self._retry_desire, self._retry_attempt = None, 0  # backoff restarts
         # skipped_duplicate: already the desired state; nothing to record.
 
     def begin_shutdown(self) -> None:
-        """Enter shutdown: stop scheduling and invalidate every in-flight result
-        by bumping gen (sync.py then clears the mailbox, stops the worker, and
-        does the final revert — design §5)."""
+        """Enter shutdown: stop scheduling, cancel any armed retry, and
+        invalidate every in-flight result by bumping gen (sync.py then clears
+        the mailbox, stops the worker, and does the final revert — design §5)."""
         self.stopping = True
         self.gen += 1
+        self._cancel_retry()
 
     # --- internals ----------------------------------------------------------
 
@@ -135,5 +174,40 @@ class Coordinator:
             self._submit((self.gen, desired))
             return
         self.gen += 1
+        self._cancel_retry()  # guard 1: a new desired value supersedes any armed retry
         self.last_submitted = desired
         self._submit((self.gen, desired))
+
+    # --- retry (SEC-018 §4) ---------------------------------------------------
+
+    def _arm_retry(self) -> None:
+        """A retryable failure for the current desire: count the attempt and arm
+        the backoff timer, or go terminal past the cap."""
+        desire = self.last_submitted
+        if desire != self._retry_desire:
+            self._retry_desire, self._retry_attempt = desire, 0  # new target: fresh count
+        self._retry_attempt += 1
+        if self._retry_attempt > RETRY_MAX_ATTEMPTS:
+            if self._retry_attempt == RETRY_MAX_ATTEMPTS + 1:  # log the transition once
+                _log.warning("giving up on %r after %d attempts",
+                             desire, RETRY_MAX_ATTEMPTS)
+            return
+        delay = backoff_delay_ms(self._retry_attempt, self._jitter)
+        self._retry_handle = self._schedule(delay, self._fire_retry)
+
+    def _fire_retry(self) -> None:
+        """The armed timer fired (main thread, via GLib). Force-resubmit the
+        retried desire with a fresh gen — bypassing _maybe_submit's value-dedup,
+        which would otherwise absorb it (its value equals last_submitted)."""
+        self._retry_handle = None  # consumed by firing; never cancel it again
+        if self.stopping:
+            return
+        if self._retry_desire is None or self._retry_desire != self.last_desired:
+            return  # guard 2: the desired state moved on between arm and fire
+        self.gen += 1  # a retry is a genuine new attempt; its result must be adoptable
+        self._submit((self.gen, self._retry_desire))
+
+    def _cancel_retry(self) -> None:
+        if self._retry_handle is not None:
+            self._cancel(self._retry_handle)
+            self._retry_handle = None

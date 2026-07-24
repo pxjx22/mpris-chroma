@@ -1,9 +1,11 @@
 import unittest
 from pathlib import Path
 
-from mpris_chroma.coordinator import Coordinator, mode_from_color_scheme
-from mpris_chroma.worker import (COMMITTED, FAILED_RETRYABLE, CoverTarget,
-                                 Desired, Result)
+from mpris_chroma.coordinator import (RETRY_BASE_MS, RETRY_CAP_MS,
+                                      RETRY_MAX_ATTEMPTS, Coordinator,
+                                      backoff_delay_ms, mode_from_color_scheme)
+from mpris_chroma.worker import (COMMITTED, FAILED_RETRYABLE, REJECTED,
+                                 CoverTarget, Desired, Result)
 
 _JF_DIR = Path("/covers/jf")
 
@@ -19,11 +21,26 @@ def _line(name, status, art=""):
 class _Harness:
     def __init__(self, mode="dark"):
         self.submitted = []
+        self.scheduled = []   # (delay_ms, fn) per armed retry timer
+        self.cancelled = []   # handles passed to cancel
+        self._next_handle = 0
         self.coord = Coordinator(
             submit=self.submitted.append,
             covers_dir_for=_covers_dir_for,
             mode=mode,
+            schedule=self._schedule,
+            cancel=self.cancelled.append,
+            jitter=lambda: 1.0,   # deterministic in tests
         )
+
+    def _schedule(self, delay_ms, fn):
+        self._next_handle += 1
+        self.scheduled.append((delay_ms, fn))
+        return self._next_handle
+
+    def fire_last_timer(self):
+        """Invoke the most recently armed retry callback (as GLib would)."""
+        self.scheduled[-1][1]()
 
     @property
     def last(self):
@@ -159,15 +176,10 @@ class AdoptTest(unittest.TestCase):
         h.coord.adopt(Result(gen, COMMITTED, "/cache/a"))
         self.assertEqual(h.coord.applied, "/cache/a")
 
-    def test_failed_resets_dedup_so_next_identical_line_retries(self):
-        # Interim (4c unit 2): failed still resets the dedup key so the next
-        # identical line resubmits (4b behavior). Unit 3 replaces this with a
-        # backoff timer (identical line dedups; the timer retries).
-        h = _Harness()
-        gen = self._apply(h)
-        h.coord.adopt(Result(gen, FAILED_RETRYABLE, None))
-        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
-        self.assertEqual(len(h.submitted), 2)  # retried, not deduped
+    # The 4b "failed resets dedup so the next identical line retries" contract is
+    # redesigned in 4c (design §4.1): recovery no longer depends on unrelated
+    # MPRIS events — the backoff timer owns resubmission and identical lines
+    # dedup. See RetryTimerTest below for the replacement contract.
 
     def test_stale_gen_result_is_dropped(self):
         h = _Harness()
@@ -183,6 +195,121 @@ class AdoptTest(unittest.TestCase):
         self._apply(h)  # gen 1 in flight, not adopted
         h.coord.on_scheme(2)
         self.assertEqual(h.last[1].mode, "light")
+
+
+class BackoffDelayTest(unittest.TestCase):
+    """Pure delay math: capped exponential with an injected jitter multiplier."""
+
+    def test_first_attempt_is_base_delay(self):
+        self.assertEqual(backoff_delay_ms(1, lambda: 1.0), RETRY_BASE_MS)
+
+    def test_delay_doubles_per_attempt(self):
+        self.assertEqual(backoff_delay_ms(2, lambda: 1.0), 2 * RETRY_BASE_MS)
+        self.assertEqual(backoff_delay_ms(3, lambda: 1.0), 4 * RETRY_BASE_MS)
+
+    def test_delay_is_capped(self):
+        self.assertEqual(backoff_delay_ms(30, lambda: 1.0), RETRY_CAP_MS)
+
+    def test_jitter_multiplies(self):
+        self.assertEqual(backoff_delay_ms(1, lambda: 1.5),
+                         int(1.5 * RETRY_BASE_MS))
+
+
+class RetryTimerTest(unittest.TestCase):
+    """Design §4/§4.1: a failed_retryable result arms a coordinator-owned
+    backoff timer that owns resubmission; identical lines dedup (the redefined
+    SEC-007 parity); both staleness guards make a stale retry structurally
+    unable to overwrite a newer track."""
+
+    def _fail_apply(self, h, art="https://x/a"):
+        h.coord.on_line(_line("spotify", "Playing", art))
+        gen = h.last[0]
+        h.coord.adopt(Result(gen, FAILED_RETRYABLE, None))
+        return gen
+
+    def test_retryable_failure_arms_timer_and_identical_line_dedups(self):
+        # The §4.1 redefinition: the timer owns the retry; a repeat of the same
+        # line no longer resubmits.
+        h = _Harness()
+        self._fail_apply(h)
+        self.assertEqual(len(h.scheduled), 1)
+        self.assertEqual(h.scheduled[0][0], RETRY_BASE_MS)
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        self.assertEqual(len(h.submitted), 1)  # deduped; timer will retry
+
+    def test_timer_fire_force_resubmits_with_fresh_gen(self):
+        h = _Harness()
+        gen = self._fail_apply(h)
+        h.fire_last_timer()
+        self.assertEqual(len(h.submitted), 2)  # force-resubmit despite dedup key
+        self.assertEqual(h.last[0], gen + 1)   # fresh gen: result is adoptable
+        self.assertEqual(h.last[1], h.submitted[0][1])  # same desire
+
+    def test_backoff_doubles_across_consecutive_failures(self):
+        h = _Harness()
+        gen = self._fail_apply(h)                       # attempt 1: base
+        h.fire_last_timer()
+        h.coord.adopt(Result(gen + 1, FAILED_RETRYABLE, None))  # attempt 2
+        self.assertEqual([d for d, _ in h.scheduled],
+                         [RETRY_BASE_MS, 2 * RETRY_BASE_MS])
+
+    def test_attempt_cap_exhausts_no_further_timer(self):
+        h = _Harness()
+        gen = self._fail_apply(h)                       # attempt 1 armed
+        for i in range(1, RETRY_MAX_ATTEMPTS + 1):      # fail every retry too
+            h.fire_last_timer()
+            h.coord.adopt(Result(gen + i, FAILED_RETRYABLE, None))
+        # attempts 2..MAX were armed; the failure past the cap armed nothing.
+        self.assertEqual(len(h.scheduled), RETRY_MAX_ATTEMPTS)
+
+    def test_gen_bump_cancels_armed_timer(self):
+        # Guard 1: any new desired value supersedes an outstanding retry.
+        h = _Harness()
+        self._fail_apply(h, art="https://x/a")
+        armed_handle = h._next_handle
+        h.coord.on_line(_line("spotify", "Playing", "https://x/b"))
+        self.assertEqual(h.cancelled, [armed_handle])
+
+    def test_late_fire_after_desire_changed_is_dropped(self):
+        # Guard 2 (fire-time): even if the callback still runs after the desire
+        # moved on, it must not submit the stale target.
+        h = _Harness()
+        self._fail_apply(h, art="https://x/a")
+        stale_fire = h.scheduled[0][1]
+        h.coord.on_line(_line("spotify", "Playing", "https://x/b"))
+        before = len(h.submitted)
+        stale_fire()  # simulates the race where cancel lost to the dispatch
+        self.assertEqual(len(h.submitted), before)  # old track cannot overwrite
+
+    def test_rejected_arms_no_timer_and_identical_line_dedups(self):
+        # A policy rejection is terminal without a metadata change: no timer,
+        # and repeats of the same line do not spin.
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.adopt(Result(h.last[0], REJECTED, None))
+        self.assertEqual(h.scheduled, [])
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        self.assertEqual(len(h.submitted), 1)
+
+    def test_new_desire_restarts_backoff_from_base(self):
+        h = _Harness()
+        gen = self._fail_apply(h, art="https://x/a")
+        h.fire_last_timer()
+        h.coord.adopt(Result(gen + 1, FAILED_RETRYABLE, None))  # A at 2x now
+        h.coord.on_line(_line("spotify", "Playing", "https://x/b"))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        self.assertEqual(h.scheduled[-1][0], RETRY_BASE_MS)  # B starts fresh
+
+    def test_shutdown_cancels_armed_timer_and_late_fire_is_noop(self):
+        h = _Harness()
+        self._fail_apply(h)
+        armed_handle = h._next_handle
+        fire = h.scheduled[0][1]
+        h.coord.begin_shutdown()
+        self.assertIn(armed_handle, h.cancelled)
+        before = len(h.submitted)
+        fire()  # late dispatch after shutdown
+        self.assertEqual(len(h.submitted), before)
 
 
 if __name__ == "__main__":

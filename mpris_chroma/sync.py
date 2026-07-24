@@ -155,8 +155,19 @@ def main():
     def _submit(item):
         _submit_guarded(item, worker, mailbox, _on_worker_dead)
 
+    def _schedule_retry(delay_ms, fn):
+        # One-shot: the wrapper returns False so GLib removes the source after
+        # it fires; the coordinator treats its handle as consumed on fire and
+        # only cancels handles that have not fired, so source_remove never sees
+        # a dead source.
+        def _cb():
+            fn()
+            return False
+        return GLib.timeout_add(int(delay_ms), _cb)
+
     coordinator = Coordinator(submit=_submit, covers_dir_for=COVERS_DIRS.get,
-                              mode=mode)
+                              mode=mode, schedule=_schedule_retry,
+                              cancel=GLib.source_remove)
 
     def _post(result):
         # Marshal a worker result to the main thread; return False so the idle
