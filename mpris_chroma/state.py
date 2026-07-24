@@ -5,8 +5,9 @@ selection and palette-mode logic speak in. Since 4b (SEC-001), the daemon tracks
 each player's *unresolved* art_url and resolves off-thread; the generation token
 that orders that async work is coordinator-scoped (a vanish of one player can
 invalidate a job scheduled for another), so it lives on the Coordinator, not
-here. A resolved-cover state machine and retry bookkeeping land in state only
-when 4c actually needs them.
+here. The 4c (SEC-018) cover-state machine and retry bookkeeping are likewise
+coordinator-scoped (coordinator.CoverState and the winner-only retry scalars) —
+this module stays the home of the immutable per-player event record only.
 """
 
 from dataclasses import dataclass

@@ -22,14 +22,19 @@ coordinator: decide(players) ──► desired palette (newest Playing wins)
         │   parses + schedules only — never blocks the GLib loop
         ▼
 worker thread ──► resolve_cover ──► extract_colors (Pillow, 3 prominent colors)
-        │   (bounded, coalesced to the newest cover; stale results rejected)
+        │   (bounded, coalesced to the newest cover; stale results rejected;
+        │    transient fetch failures retried with capped backoff)
         └─► wlchroma: wlchroma-ctl set-colors <c1> <c2> <c3> <fade_ms>
 ```
 
 - **Multi-player:** The daemon watches both `jellyfin-tui` and `spotify`. The most
   recent Playing player's cover is applied (most recent play event takes precedence);
   its download and decode run on a background worker, so the daemon stays responsive
-  and only the newest cover is ever applied. When nothing is Playing — paused, stopped,
+  and only the newest cover is ever applied. A transient artwork failure (network
+  blip, cover file not written yet) retries automatically with capped backoff; if
+  the newest player's cover can't be resolved, the most recent player whose cover
+  can is shown instead, and the current palette is held — never replaced with a
+  wrong one — while that plays out. When nothing is Playing — paused, stopped,
   or closed — the desktop reverts to the configured wlchroma palette.
 - **wlchroma:** all three palette slots are set to the three most apparent,
   visibly-distinct colors in the cover. Ranking is vibrancy-weighted (coverage
