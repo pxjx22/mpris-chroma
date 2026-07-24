@@ -312,5 +312,123 @@ class RetryTimerTest(unittest.TestCase):
         self.assertEqual(len(h.submitted), before)
 
 
+def _commit(h, cover_id="/cache/x"):
+    """Adopt a committed result for the most recent submission."""
+    h.coord.adopt(Result(h.last[0], COMMITTED, cover_id))
+
+
+class RankingTest(unittest.TestCase):
+    """Design §5 (revised): state-based eligibility, RETRYING stays selected,
+    adopt re-runs selection, retone anchors on the applied cover. These are the
+    three review defects plus the restored cover-aware ranking, as behavior."""
+
+    def test_rejected_newest_falls_back_to_older_ready_without_new_event(self):
+        # Defect 3: the fallback happens inside adopt, not on the next event.
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")                        # older player READY+applied
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))  # newer wins
+        h.coord.adopt(Result(h.last[0], REJECTED, None))
+        gen, desired = h.last
+        self.assertEqual(desired.target, CoverTarget("https://x/j", _JF_DIR))
+
+    def test_own_event_of_applied_player_does_not_flap_to_other_ready(self):
+        # Defect 1: an event from the applied newest player must dedup, not hand
+        # the palette to the other ready player.
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))
+        _commit(h, "/cache/s")                        # spotify newest, applied
+        before = len(h.submitted)
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))  # repeat
+        self.assertEqual(len(h.submitted), before)    # deduped, no flap
+
+    def test_retrying_newest_stays_selected_and_timer_survives(self):
+        # Defect 2: the RETRYING winner is not skipped, so its own retry timer
+        # is not gen-bump-cancelled by a fallback submission.
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))
+        before = len(h.submitted)
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        self.assertEqual(len(h.submitted), before)    # no fallback submission
+        self.assertEqual(h.cancelled, [])             # timer survives
+        self.assertEqual(len(h.scheduled), 1)
+
+    def test_exhausted_newest_falls_back_to_older_ready(self):
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))
+        gen = h.last[0]
+        h.coord.adopt(Result(gen, FAILED_RETRYABLE, None))     # attempt 1
+        for i in range(1, RETRY_MAX_ATTEMPTS + 1):
+            h.fire_last_timer()
+            h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        # The exhaustion transition itself falls back to the older ready cover.
+        self.assertEqual(h.last[1].target, CoverTarget("https://x/j", _JF_DIR))
+
+    def test_transient_failure_retries_and_eventually_applies(self):
+        # Ledger required test #1, end to end at the coordinator level.
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        h.fire_last_timer()
+        h.coord.adopt(Result(h.last[0], COMMITTED, "/cache/a"))
+        self.assertEqual(h.coord.applied, "/cache/a")
+
+    def test_retone_anchors_on_applied_cover_not_retrying_winner(self):
+        # §5: a theme flip re-tones what is SHOWING even while a newer player is
+        # mid-retry — the exact 4b gap this closes.
+        h = _Harness(mode="dark")
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")                        # jellyfin applied
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))  # spotify retrying
+        h.coord.on_scheme(2)                          # flip to light
+        gen, desired = h.last
+        self.assertEqual(desired,
+                         Desired(CoverTarget("https://x/j", _JF_DIR), "light"))
+
+    def test_retone_commit_restarts_the_superseded_retry_chain(self):
+        # The retone's gen bump cancels the retrying winner's timer and demotes
+        # it to PENDING; the retone commit then re-selects it fresh in new mode.
+        h = _Harness(mode="dark")
+        h.coord.on_line(_line("jellyfin-tui", "Playing", "https://x/j"))
+        _commit(h, "/cache/j")
+        h.coord.on_line(_line("spotify", "Playing", "https://x/s"))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        h.coord.on_scheme(2)                          # retone jellyfin; timer dies
+        self.assertEqual(len(h.cancelled), 1)         # spotify's timer cancelled
+        _commit(h, "/cache/j")                        # retone lands
+        gen, desired = h.last
+        self.assertEqual(desired,
+                         Desired(CoverTarget("https://x/s", None), "light"))
+
+    def test_exhausted_dir_player_recovers_on_its_next_line(self):
+        # A dir-scan player's art identity never changes, so exhaustion resets on
+        # the player's next MPRIS event (the reviewed recovery boundary) — it
+        # must not strand forever.
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", ""))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        for i in range(1, RETRY_MAX_ATTEMPTS + 1):
+            h.fire_last_timer()
+            h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        before = len(h.submitted)                     # exhausted; no timer left
+        h.coord.on_line(_line("jellyfin-tui", "Playing", ""))  # next track
+        self.assertEqual(len(h.submitted), before + 1)  # re-attempted
+
+    def test_rejected_player_recovers_on_identity_change(self):
+        # Policy rejection is terminal for THAT metadata; new artwork unlocks it.
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/bad"))
+        h.coord.adopt(Result(h.last[0], REJECTED, None))
+        h.coord.on_line(_line("spotify", "Playing", "https://x/good"))
+        self.assertEqual(h.last[1].target, CoverTarget("https://x/good", None))
+
+
 if __name__ == "__main__":
     unittest.main()
