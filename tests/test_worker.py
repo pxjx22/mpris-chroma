@@ -1,8 +1,10 @@
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
 from mpris_chroma.apply import CtlError
-from mpris_chroma.cover import Ready, Rejected, Retryable
+from mpris_chroma.cover import Ready, Rejected, Retryable, resolve_cover
 from mpris_chroma.worker import CoverTarget, Desired, Mailbox, Worker
 
 
@@ -160,6 +162,53 @@ class WorkerServeTest(unittest.TestCase):
         )
         w._serve(self._apply(5))
         self.assertEqual([r.outcome for r in reported], ["failed_retryable"])
+
+
+class RealResolveIdentityTest(unittest.TestCase):
+    """Unit 5 (SEC-018): content identity end-to-end through the REAL
+    resolve_cover with real files — no fakes on the resolve side. These are
+    integration guards for the cover.py <-> worker seam (each half was built
+    RED-first under fakes in units 1-2); they verify the ledger requirement
+    'replacing a file at the same path triggers re-extraction' as shipped."""
+
+    def _worker(self, extracted):
+        return Worker(
+            Mailbox(),
+            resolve=resolve_cover,   # the real resolver (dir-scan path)
+            extract=lambda p, m: extracted.append(p) or ("#1", "#2", "#3"),
+            apply=lambda *c: None,
+            revert=lambda: None,
+            report=lambda r: None,
+        )
+
+    def test_file_overwritten_in_place_reextracts(self):
+        with tempfile.TemporaryDirectory() as d:
+            covers = Path(d)
+            img = covers / "cover.jpg"
+            img.write_bytes(b"ONE")
+            extracted = []
+            w = self._worker(extracted)
+            desired = Desired(CoverTarget("", covers), "dark")
+            r1 = w._run_once((1, desired))
+            img.write_bytes(b"TWO-LONGER")     # same path, new size+mtime
+            os.utime(img, ns=(1, 1))           # force a distinct mtime_ns too
+            r2 = w._run_once((2, desired))
+        self.assertEqual(r1.outcome, "committed")
+        self.assertEqual(r2.outcome, "committed")   # NOT skipped_duplicate
+        self.assertEqual(len(extracted), 2)         # re-extracted
+
+    def test_unchanged_file_is_skipped_duplicate(self):
+        with tempfile.TemporaryDirectory() as d:
+            covers = Path(d)
+            (covers / "cover.jpg").write_bytes(b"ONE")
+            extracted = []
+            w = self._worker(extracted)
+            desired = Desired(CoverTarget("", covers), "dark")
+            r1 = w._run_once((1, desired))
+            r2 = w._run_once((2, desired))      # nothing changed on disk
+        self.assertEqual(r1.outcome, "committed")
+        self.assertEqual(r2.outcome, "skipped_duplicate")
+        self.assertEqual(len(extracted), 1)
 
 
 class _FakeMailbox:
