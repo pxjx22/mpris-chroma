@@ -421,6 +421,23 @@ class RankingTest(unittest.TestCase):
         h.coord.on_line(_line("jellyfin-tui", "Playing", ""))  # next track
         self.assertEqual(len(h.submitted), before + 1)  # re-attempted
 
+    def test_exhausted_url_player_recovers_on_its_next_line(self):
+        # F1 (review): a url player's identity — and hence its desired value —
+        # is unchanged on its next line, so the EXHAUSTED->PENDING reset must
+        # also clear the dedup key or value-dedup absorbs the resubmit and the
+        # player strands (recovered network, same track, stale palette).
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        for i in range(1, RETRY_MAX_ATTEMPTS + 1):
+            h.fire_last_timer()
+            h.coord.adopt(Result(h.last[0], FAILED_RETRYABLE, None))
+        before = len(h.submitted)                     # exhausted; no timer left
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))  # same track
+        self.assertEqual(len(h.submitted), before + 1)   # re-attempted
+        self.assertGreater(h.last[0], h.submitted[-2][0])  # fresh gen, not the
+        #                                     dir-style same-gen resubmit path
+
     def test_rejected_player_recovers_on_identity_change(self):
         # Policy rejection is terminal for THAT metadata; new artwork unlocks it.
         h = _Harness()

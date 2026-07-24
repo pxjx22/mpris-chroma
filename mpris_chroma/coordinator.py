@@ -149,6 +149,15 @@ class Coordinator:
             self.covers[name] = CoverState(ident, COVER_PENDING)
         elif st.status == COVER_EXHAUSTED:
             st.status = COVER_PENDING
+            # F1: clear the dedup key too — a url player's identity (and hence
+            # its desired value) is unchanged on its next line, so value-dedup
+            # would otherwise absorb the resubmit and leave PENDING inert
+            # (recovered network, same track, stale palette until track change).
+            # Spin-safe: this fires only on the EXHAUSTED->PENDING edge, so
+            # identical lines between exhaustion episodes still dedup — each
+            # own-event buys exactly one bounded retry window. The gen bump on
+            # the resubmit also resets the attempt counters via _cancel_retry.
+            self.last_submitted = None
         self._decide_and_submit(dir_resubmit=True)
 
     def on_vanish(self, bus_name: str) -> None:
