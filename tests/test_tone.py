@@ -184,6 +184,31 @@ class SeparationTest(unittest.TestCase):
         ranked = [after[i].L for i in order]
         self.assertEqual(ranked, sorted(ranked))
 
+    def test_upper_envelope_near_collision_holds_rank_order_in_light_mode(self):
+        # Finding 1 (pre-merge review): test_no_slot_crosses_a_neighbour above
+        # and test_out_of_envelope_input_still_holds_order_and_budget below
+        # never sample a case where the neighbour clamp at tone.py:194-197
+        # actually binds — 200k-trial fuzzing of random in-envelope palettes
+        # found 5,027 outputs change when the clamp is deleted, 4,460 of them
+        # inverting rank order, yet all existing tests (including the two
+        # named above) stayed green throughout. This fixture is one such
+        # case: a light-mode near-collision triple in the upper envelope
+        # where, without the clamp, the highest slot gets pushed down past
+        # the middle one. Values are a fixed instance pulled from that fuzz
+        # run, hardcoded here so the test is deterministic.
+        before = [
+            Toned(L=0.7130591368263828, h=4.139371341539623, c_src=0.014453312347017083),
+            Toned(L=0.6532652310289819, h=1.671075333698124, c_src=0.11318619824925734),
+            Toned(L=0.6747783701248393, h=0.4038952174457016, c_src=0.014586514882551428),
+        ]
+        order = sorted(range(3), key=lambda i: before[i].L)
+        after, _ = tone.separate(before, "light", 3)
+        # A do-nothing separate() would trivially preserve order too; prove
+        # the palette actually moved so this test can't pass by inaction.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
+        ranked = [after[i].L for i in order]
+        self.assertEqual(ranked, sorted(ranked))
+
     def test_output_stays_inside_the_envelope(self):
         lo, hi = ENVELOPES["dark"]
         before = self._collide()

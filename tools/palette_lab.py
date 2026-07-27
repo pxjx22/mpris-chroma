@@ -434,12 +434,11 @@ def main() -> int:
                 # Advance in whatever direction the walker was already
                 # travelling so this can't get stuck bouncing at one index;
                 # running off either end exits the while loop normally.
-                # Moving left clamps at 0 rather than going negative — the
-                # At the low edge the skip must bounce AND stay bounced. A
-                # plain max(0, i-1) leaves i unchanged, so a corrupt cover at
-                # index 0 re-renders forever; bouncing without flipping
-                # `direction` ping-pongs 0<->1 forever when both are corrupt.
-                # Flipping means the scan continues forward past the whole run.
+                # At the low edge (i == 0, direction < 0) there is no lower
+                # index to bounce into, so the scan direction flips to
+                # forward instead — that is what lets a run of corrupt
+                # covers starting at index 0 be scanned past, rather than
+                # spinning forever re-rendering the same cover.
                 # This matters more than it looks: raw mode is held across this
                 # loop, so a spin never reaches _read_key, and Ctrl-C arrives
                 # as an unconsumed byte with ISIG off — the only way out would
