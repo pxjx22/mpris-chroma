@@ -261,9 +261,10 @@ mechanism that stops it.
   `FormatAllowlistTest`, `DecodeBoundsTest` and `ColorDataBoundsTest` classes
   stay exactly as written and must still pass. The undecodable-cover fallback
   triple `#a48ec7 ×3` is unchanged, and still logged at WARNING.
-- **Selection stays mode-independent.**
-  `test_mode_switch_never_changes_which_colors_are_picked` must pass unmodified.
-  Mode enters at stage 3 only; stages 1–2 never see it.
+- **Selection stays mode-independent.** Mode enters at stage 3 only; stages 1–2
+  never see it. `test_mode_switch_never_changes_which_colors_are_picked` asserts
+  this, but **must be restated in Oklab hue** — see below; its current HSV form
+  cannot survive this design and its intent is not what fails.
 - **Hue is never modified** by toning, gamut mapping, or separation, in either
   mode.
 - **Grayscale covers stay grayscale** (`NEUTRAL_C` exemption).
@@ -286,15 +287,44 @@ explicitly so the diff is not a surprise:
 - **Replaced** — `ClampTest` and `ModeBandTest` in full: they assert on
   `clamp_hsv` and the `BANDS` value bands, both of which cease to exist. Their
   intent survives as the envelope, hue-invariance and neutral-preservation
-  properties below. (`test_hex_of_roundtrips_format` carries over unchanged.)
-- **Restated in Oklab terms**, same intent, three tests in `ExtractTest`:
+  properties below. `test_hex_of_roundtrips_format` goes with them —
+  `hex_of` is dead once slots format themselves via Oklab, and the round-trip it
+  guarded is covered by the color-space module's own hex round-trip test.
+- **Restated in Oklab terms**, same intent, four tests in `ExtractTest`:
   `test_dark_colored_cover_is_lifted_to_readable` (S_MIN/V_MIN → chroma fraction
   and envelope), `test_grayscale_cover_stays_neutral` (S_MIN → `NEUTRAL_C`),
-  `test_light_mode_same_hues_brighter_values` (`BANDS` → `ENVELOPES`).
+  `test_light_mode_same_hues_brighter_values` (`BANDS` → `ENVELOPES`), and
+  `test_mode_switch_never_changes_which_colors_are_picked` — see below.
+
+### The mode-independence test must change, and why that is not a retreat
+
+An earlier draft of this spec froze
+`test_mode_switch_never_changes_which_colors_are_picked`. That was wrong, and
+measurement caught it before implementation started.
+
+The test compares **HSV** hue across a mode flip to 2 decimal places (tolerance
+0.005). This design holds **Oklab** hue exactly fixed — but HSV hue and Oklab
+hue are different quantities, and converting one fixed Oklab hue back to sRGB at
+two different lightnesses yields two slightly different HSV hues. Measured on
+the test's own fixture: Oklab hue drift is **0.00e+00**, HSV hue drift is up to
+**0.0286** — 5.7× the tolerance. The test fails on all three slots.
+
+Nothing about the invariant is broken. Selection really is mode-independent;
+the same three source colors are picked in both modes. What fails is the
+test's *proxy* for "same color", which stopped being valid the moment toning
+moved out of HSV.
+
+The restatement asserts the invariant more directly and more strictly than the
+original: **Oklab hue must be bit-identical across modes**, not merely close.
+`assertEqual` on the hue angle, not `assertAlmostEqual`.
+
+By contrast `test_small_vivid_accent_makes_the_palette` — the other HSV-hue
+assertion — compares source to output *within* one mode at a 0.04 tolerance, and
+measures a drift of 0.0017. It stays frozen.
 - **Frozen — the test methods themselves must not be edited**, and must still
   pass as written: `VibrancyScoreTest`, `FormatAllowlistTest`,
-  `DecodeBoundsTest`, `ColorDataBoundsTest`, and the remaining six `ExtractTest`
-  cases, notably `test_mode_switch_never_changes_which_colors_are_picked` and
+  `DecodeBoundsTest`, `ColorDataBoundsTest`, and the remaining five `ExtractTest`
+  cases, notably `test_small_vivid_accent_makes_the_palette` and
   `test_solid_cover_repeats_not_invents`. This constrains the *source of the
   tests*, not the palettes they exercise — toning changes almost every extracted
   hex, which is the point of the work; these tests are frozen precisely because
