@@ -136,6 +136,11 @@ gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'   # or 'pre
 Neither approach needs any change on this daemon's side. Either way it
 re-tones the current cover in place: same hues, different lightness envelope.
 
+The two differ in latency, which is worth knowing if a flip feels sluggish: the
+portal-backend route reaches the daemon directly over `SettingChanged`, while
+the gsettings route depends on `xdg-desktop-portal-gtk` noticing the key and
+republishing it.
+
 ## Tuning
 
 Color feel is controlled by constants in `mpris_chroma/tone.py` (toning and

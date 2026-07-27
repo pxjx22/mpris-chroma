@@ -13,8 +13,8 @@ this module stays the home of the immutable per-player event record only.
 from dataclasses import dataclass
 from typing import Literal
 
-# Palette brightness band. Hue/saturation always come from the cover; the mode
-# only remaps how bright the palette lands (see colors.BANDS).
+# Theme mode. Hue always comes from the cover; the mode only decides where the
+# palette sits in lightness and how much chroma it carries (see tone.ENVELOPES).
 Mode = Literal["dark", "light"]
 
 
