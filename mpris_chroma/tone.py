@@ -98,7 +98,10 @@ def tone(source_lch: list[tuple[float, float, float]], mode: str) -> list[Toned]
 MIN_DE = 0.10                # pairs closer than this in Oklab read as duplicates
 SEPARATION_STEP = 0.01       # per-pass lightness nudge
 MAX_SEPARATION_SHIFT = 0.04  # total displacement any one slot may accumulate
-MAX_SEPARATION_PASSES = 8    # loop safety net; the budget above binds first
+MAX_SEPARATION_PASSES = 8    # iteration cap. Usually the budget binds first (a
+                             # slot taking full steps spends 0.04 in 4 passes),
+                             # but clamping yields partial steps with no lower
+                             # bound, so this is a real terminal condition too.
 _BUDGET_EPS = 1e-9           # float tolerance for "budget fully spent"; repeated
                              # subtraction settles a few ulps above exact 0.0
 

@@ -232,8 +232,8 @@ class SeparationTest(unittest.TestCase):
 
     def test_budget_exhaustion_is_reported_distinctly(self):
         # Each terminal condition must be reachable and correctly named, or the
-        # reason string is decoration rather than diagnosis. These two sit mid
-        # envelope with room to move, so "envelope" is ruled out and only the
+        # reason string is decoration rather than diagnosis. These sit mid
+        # envelope with room to move, so "blocked" is ruled out and only the
         # displacement budget can stop them.
         lo, hi = ENVELOPES["dark"]
         mid = (lo + hi) / 2
@@ -309,7 +309,7 @@ class SeparationTest(unittest.TestCase):
         # spent. The result is a pair where budget is NOT all exhausted
         # (slot 0's is untouched) yet nothing can move — genuinely blocked by
         # the envelope, not by allowance.
-        lo, hi = ENVELOPES["dark"]
+        _, hi = ENVELOPES["dark"]
         h = math.radians(29)
         slots = [Toned(L=hi, h=h, c_src=0.05),
                  Toned(L=hi - 0.03, h=h, c_src=0.05)]
