@@ -110,7 +110,7 @@ class SeparationResult:
     one — but it must be observable rather than silent (SEC-019 precedent)."""
 
     resolved: bool
-    reason: str          # clear | duplicates | envelope | budget | passes
+    reason: str          # clear | duplicates | budget | blocked | passes
     residual_de: float   # closest remaining pair; MIN_DE or more when resolved
 
 
@@ -135,6 +135,10 @@ def separate(slots: list[Toned], mode: str,
     would invent contrast the cover does not have.
     """
     lo, hi = ENVELOPES[mode]
+    if n_distinct > len(slots):
+        raise ValueError(
+            f"n_distinct ({n_distinct}) exceeds the number of slots ({len(slots)})"
+        )
     if n_distinct < 2:
         return list(slots), SeparationResult(False, "duplicates", 0.0)
 
@@ -143,7 +147,10 @@ def separate(slots: list[Toned], mode: str,
     # move is clamped against neighbours in this order, which is what makes
     # monotonicity hold by construction: pushing a pair apart preserves that
     # pair's order, but unclamped it could shove a slot past a *third* one.
+    # `rank` is derived from `order` and `order` never changes after this
+    # point, so it is built once here rather than rebuilt every pass.
     order = sorted(range(n_distinct), key=lambda i: (work[i].L, i))
+    rank = {slot: pos for pos, slot in enumerate(order)}
     budget = [MAX_SEPARATION_SHIFT] * n_distinct
     reason = "passes"
 
@@ -153,7 +160,6 @@ def separate(slots: list[Toned], mode: str,
             reason = "clear"
             break
         # Move the higher-ranked slot of the pair up and the lower one down.
-        rank = {slot: pos for pos, slot in enumerate(order)}
         up, down = (i, j) if rank[i] > rank[j] else (j, i)
         moved = False
         for idx, direction in ((up, +1.0), (down, -1.0)):
@@ -161,38 +167,60 @@ def separate(slots: list[Toned], mode: str,
             if step <= 0.0:
                 continue
             target = work[idx].L + direction * step
-            # Three bounds: the envelope, the slot's remaining budget (already
-            # applied via `step`), and its immediate neighbours' current
-            # positions, so ranks can never swap.
+            # Envelope first, then neighbours: clamping into [lo, hi] here
+            # means the neighbour clamp below only ever narrows further
+            # toward work[idx].L, never reopens room the envelope had just
+            # closed off. Applying it last (as this used to) let the
+            # neighbour clamp hand back a target the envelope had rejected,
+            # which could invert rank order and blow the budget in one move
+            # when the input already sat outside the envelope.
+            target = min(hi, max(lo, target))
+            # For input already outside the envelope, clamping alone is not
+            # enough: if work[idx].L is already past the bound on the side
+            # this move is heading further into, the clamp snaps `target`
+            # back across work[idx].L in the *opposite* direction from the
+            # one requested — e.g. a slot already above `hi` asked to move
+            # further up gets clamped down to `hi`, which is a downward
+            # move, not an upward one. That is not this slot's separation
+            # move; refuse it rather than apply it, or it can shove the
+            # slot straight through a neighbour it was never cleared
+            # against and invert rank order.
+            if (target - work[idx].L) * direction <= 0.0:
+                continue
             pos = rank[idx]
             if direction > 0 and pos + 1 < n_distinct:
                 target = min(target, work[order[pos + 1]].L)
             if direction < 0 and pos - 1 >= 0:
                 target = max(target, work[order[pos - 1]].L)
-            target = min(hi, max(lo, target))
-            delta = abs(target - work[idx].L)
-            if delta <= 0.0:
+            delta = target - work[idx].L
+            if delta * direction <= 0.0:
                 continue
+            # Final cap at the slot's remaining budget. For in-envelope input
+            # this is a no-op (the clamps above already keep |delta| <= step
+            # <= budget[idx]), but for out-of-envelope input the envelope
+            # clamp above can jump `target` further than `step` allowed (e.g.
+            # snapping straight to `lo` from well below it) — the budget must
+            # still win that fight, or the displacement invariant breaks on
+            # exactly the input this routine is supposed to tame.
+            if abs(delta) > budget[idx]:
+                delta = budget[idx] if delta > 0 else -budget[idx]
+            target = work[idx].L + delta
+            delta = abs(delta)
             budget[idx] -= delta
             work[idx] = Toned(L=target, h=work[idx].h, c_src=work[idx].c_src)
             moved = True
-        if not moved:
-            # Nothing could move: either every slot is pinned at an envelope
-            # bound or every budget is spent. Distinguish the two so the reason
-            # is diagnostic rather than a catch-all. Repeated float subtraction
-            # rarely lands a spent budget on exact 0.0 (it settles a few ulps
-            # above), so this is a tolerance comparison, not an exact one.
-            reason = "budget" if all(b <= _BUDGET_EPS for b in budget) else "envelope"
-            break
+        # Check exhaustion before blockage so both stay reachable: a pass that
+        # spends the last of every budget still counts as "moved", so without
+        # this check first, budget exhaustion could hide behind next pass's
+        # "not moved" and get mislabeled — or never fire at all if the pass
+        # cap is hit on the same pass. Repeated float subtraction rarely lands
+        # a spent budget on exact 0.0 (it settles a few ulps above), so this
+        # is a tolerance comparison, not an exact one.
         if all(b <= _BUDGET_EPS for b in budget):
-            # Detect exhaustion the moment it happens rather than waiting for a
-            # following pass to confirm nothing moves: a pass that spends the
-            # last of every slot's budget still counts as "moved" above, so
-            # without this check a palette that exhausts budget on exactly the
-            # final permitted pass would fall through with no break ever fired,
-            # leaving `reason` at its "passes" default — mislabeling budget
-            # exhaustion as a pass-cap hit.
-            reason = "budget"
+            reason = "budget"          # every slot spent its full allowance
+            break
+        if not moved:
+            reason = "blocked"         # budget remains; envelope or neighbour pins it
             break
 
     residual = _closest_pair(work)[2]

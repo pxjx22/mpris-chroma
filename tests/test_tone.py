@@ -156,6 +156,9 @@ class SeparationTest(unittest.TestCase):
     def test_hue_is_never_modified(self):
         before = self._collide()
         after, _ = tone.separate(before, "dark", 3)
+        # Prove the palette moved at all — otherwise "hue unchanged" is true
+        # of any do-nothing separate() and asserts nothing about this one.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
         for a, b in zip(before, after):
             self.assertAlmostEqual(a.h, b.h, places=12)
 
@@ -163,6 +166,9 @@ class SeparationTest(unittest.TestCase):
         # The bound on separation's departure from source fidelity (spec §6).
         before = self._collide()
         after, _ = tone.separate(before, "dark", 3)
+        # A do-nothing separate() would satisfy every assertion below for free;
+        # this precondition proves the routine actually moved something.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
         for a, b in zip(before, after):
             self.assertLessEqual(abs(a.L - b.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
 
@@ -172,12 +178,20 @@ class SeparationTest(unittest.TestCase):
         before = self._collide()
         order = sorted(range(3), key=lambda i: before[i].L)
         after, _ = tone.separate(before, "dark", 3)
+        # A do-nothing separate() would trivially preserve order too; prove the
+        # palette actually moved so this test can't pass by inaction.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
         ranked = [after[i].L for i in order]
         self.assertEqual(ranked, sorted(ranked))
 
     def test_output_stays_inside_the_envelope(self):
         lo, hi = ENVELOPES["dark"]
-        after, _ = tone.separate(self._collide(), "dark", 3)
+        before = self._collide()
+        after, _ = tone.separate(before, "dark", 3)
+        # The source colliding palette is already inside the envelope (it came
+        # from tone()), so staying inside it proves nothing on its own unless
+        # something actually moved.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
         for slot in after:
             self.assertGreaterEqual(slot.L, lo - 1e-9)
             self.assertLessEqual(slot.L, hi + 1e-9)
@@ -196,8 +210,14 @@ class SeparationTest(unittest.TestCase):
     def test_two_distinct_slots_separate_and_the_pad_follows(self):
         src = [_lch("#d1a973"), _lch("#b89265")]
         toned = tone.tone(src, "dark") + [tone.tone(src, "dark")[-1]]
-        after, _ = tone.separate(toned, "dark", 2)
+        after, result = tone.separate(toned, "dark", 2)
         self.assertEqual(after[1].L, after[2].L)   # pad still mirrors slot 2
+        # "separate" means the two real slots actually moved apart, not just
+        # that the pad tagged along — a do-nothing separate() would satisfy
+        # the mirroring assertion above for free.
+        de = oklab.delta_e(after[0].to_lab(), after[1].to_lab())
+        self.assertGreaterEqual(de, tone.MIN_DE - 1e-9)
+        self.assertTrue(result.resolved)
 
     def test_monochrome_collision_reports_rather_than_forcing(self):
         # Two colors that are the same hue and nearly the same lightness cannot
@@ -206,7 +226,7 @@ class SeparationTest(unittest.TestCase):
         src = [_lch("#4a4a4a"), _lch("#4b4b4b"), _lch("#4c4c4c")]
         _, result = tone.separate(tone.tone(src, "dark"), "dark", 3)
         self.assertFalse(result.resolved)
-        self.assertIn(result.reason, ("budget", "envelope", "passes"))
+        self.assertIn(result.reason, ("budget", "blocked", "passes"))
         self.assertGreater(result.residual_de, 0.0)
         self.assertLess(result.residual_de, tone.MIN_DE)
 
@@ -225,13 +245,27 @@ class SeparationTest(unittest.TestCase):
         self.assertEqual(result.reason, "budget")
         self.assertFalse(result.resolved)
         for before, moved in zip(slots, after):
-            self.assertLess(abs(before.L - moved.L), lo)   # nowhere near a bound
+            # Relative to the actual budget constant, not the unrelated
+            # envelope bound `lo` the old comparison happened to be smaller
+            # than — that version was trivially true regardless of behavior.
+            self.assertLessEqual(abs(before.L - moved.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
 
     def test_budget_binds_before_the_pass_cap(self):
-        # The two constants are not redundant: the displacement budget is the
-        # operative limit and the pass cap is only a loop safety net.
-        self.assertLess(tone.MAX_SEPARATION_SHIFT / tone.SEPARATION_STEP,
-                        tone.MAX_SEPARATION_PASSES)
+        # The previous version of this test did arithmetic on the two
+        # constants and never called separate() — it asserted a property that
+        # is also false: clamped partial steps let some colliding palettes
+        # burn all 8 passes with budget still unspent (reason "passes",
+        # observed in randomized runs). What must actually hold, on real
+        # input, is that the budget is never exceeded regardless of which of
+        # the defined reasons ends the run.
+        before = self._collide()
+        after, result = tone.separate(before, "dark", 3)
+        # A do-nothing separate() could report any fixed reason it likes and
+        # trivially satisfy the budget check below; require proof it acted.
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
+        self.assertIn(result.reason, ("clear", "duplicates", "budget", "blocked", "passes"))
+        for a, b in zip(before, after):
+            self.assertLessEqual(abs(a.L - b.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
 
     def test_separation_terminates_in_light_mode_too(self):
         after, result = tone.separate(self._collide("light"), "light", 3)
@@ -239,7 +273,52 @@ class SeparationTest(unittest.TestCase):
         for slot in after:
             self.assertGreaterEqual(slot.L, lo - 1e-9)
             self.assertLessEqual(slot.L, hi + 1e-9)
-        self.assertIn(result.reason, ("clear", "budget", "envelope", "passes"))
+        self.assertIn(result.reason, ("clear", "budget", "blocked", "passes"))
+
+    def test_out_of_envelope_input_still_holds_order_and_budget(self):
+        # Finding 1's reproduction: slots that arrive below the dark envelope
+        # (lo=0.15) entirely. The old code clamped the envelope *after* the
+        # neighbour clamp, so it could override both: rank order inverted and
+        # one slot moved 0.05 against a 0.04 budget. Only ordering and budget
+        # are claimed here — the envelope itself cannot be guaranteed for a
+        # starting point that already violates it.
+        h = math.radians(29)
+        before = [Toned(L=0.10, h=h, c_src=0.05),
+                  Toned(L=0.105, h=h, c_src=0.05),
+                  Toned(L=0.11, h=h, c_src=0.05)]
+        after, result = tone.separate(before, "dark", 3)
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
+        # Ordering: rank order among the three must survive.
+        order = sorted(range(3), key=lambda i: before[i].L)
+        ranked = [after[i].L for i in order]
+        self.assertEqual(ranked, sorted(ranked))
+        # Budget: no slot may move further than its allowance, even though
+        # the unclamped envelope target would have demanded more.
+        for a, b in zip(before, after):
+            self.assertLessEqual(abs(a.L - b.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
+        self.assertIn(result.reason, ("clear", "budget", "blocked", "passes"))
+
+    def test_blocked_is_reachable_when_a_slot_is_pinned_at_a_bound(self):
+        # "blocked" means budget remains but the envelope or a neighbour pins
+        # the slot — distinct from "budget" (allowance spent) and "passes"
+        # (loop cap hit). Slot 0 starts already at the dark envelope's
+        # ceiling, colliding with slot 1 just below it: slot 0 can never move
+        # up (every pass's envelope clamp caps its target at `hi`, its own
+        # current value, so delta is always 0 and its budget is never
+        # touched) while slot 1 moves down each pass until its own budget is
+        # spent. The result is a pair where budget is NOT all exhausted
+        # (slot 0's is untouched) yet nothing can move — genuinely blocked by
+        # the envelope, not by allowance.
+        lo, hi = ENVELOPES["dark"]
+        h = math.radians(29)
+        slots = [Toned(L=hi, h=h, c_src=0.05),
+                 Toned(L=hi - 0.03, h=h, c_src=0.05)]
+        after, result = tone.separate(slots, "dark", 2)
+        self.assertEqual(result.reason, "blocked")
+        self.assertFalse(result.resolved)
+        # Slot 0 never left the ceiling it started pinned against.
+        self.assertEqual(after[0].L, hi)
+        self.assertLessEqual(abs(slots[1].L - after[1].L), tone.MAX_SEPARATION_SHIFT + 1e-9)
 
 
 if __name__ == "__main__":
