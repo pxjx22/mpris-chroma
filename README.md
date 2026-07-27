@@ -39,14 +39,20 @@ worker thread ──► resolve_cover ──► extract_colors (Pillow, 3 promin
 - **wlchroma:** all three palette slots are set to the three most apparent,
   visibly-distinct colors in the cover. Ranking is vibrancy-weighted (coverage
   plus a chroma bonus), so a small vivid accent — a logo, a face — can take a
-  slot from a large drab background instead of the palette being all backdrop. Colors are only lifted for visibility, never invented — a grayscale cover
-  stays neutral rather than being tinted. Colors cross-fade over `FADE_MS`
+  slot from a large drab background instead of the palette being all backdrop.
+  Colors are never invented: hues come from the cover, and a grayscale cover
+  stays grey rather than being tinted. Colors cross-fade over `FADE_MS`
   (see `mpris_chroma/apply.py`) instead of snapping.
-- **Light/dark aware:** hue and saturation always come from the cover; only the
-  *brightness band* follows your desktop theme. The daemon reads `color-scheme`
-  from the freedesktop settings portal and re-tones the current palette live when
-  you flip themes (same hues, shifted values). Set `MPRIS_CHROMA_MODE=light` or
-  `dark` to force a band (skips the portal); unset follows the system, defaulting
+- **Light/dark aware:** hue always comes from the cover; the theme decides where
+  the palette sits in *lightness*. Each cover is toned into a per-mode Oklab
+  envelope — compressed relative to other covers, so a bright cover cannot wash
+  out the desktop, but keeping that cover's own contrast, so a flat cover stays
+  flat and a contrasty one stays contrasty. Chroma is then set as a fraction of
+  what sRGB can actually show at that lightness and hue, which is what keeps
+  dark palettes saturated instead of muddy. The daemon reads `color-scheme` from
+  the freedesktop settings portal and re-tones the current palette live when you
+  flip themes (same hues, different lightness). Set `MPRIS_CHROMA_MODE=light` or
+  `dark` to force a mode (skips the portal); unset follows the system, defaulting
   to dark when no portal answers or no preference is set.
 - **Revert:** Only Playing holds the album colors. When every player is Paused, Stopped,
   **or has exited**, the desktop fades back to the palette in wlchroma's config
@@ -91,20 +97,83 @@ systemctl --user status mpris-chroma
 journalctl --user -u mpris-chroma -f      # live logs
 ```
 
+## Theme switching
+
+The daemon subscribes to `SettingChanged` on `org.freedesktop.portal.Settings`,
+so anything that implements the portal's Settings interface drives it live — no
+restart, no configuration on this side. Check what your desktop currently
+reports with:
+
+```bash
+gdbus call --session --dest org.freedesktop.portal.Desktop \
+  --object-path /org/freedesktop/portal/desktop \
+  --method org.freedesktop.portal.Settings.ReadOne \
+  org.freedesktop.appearance color-scheme
+```
+
+`uint32 1` is prefer-dark, `2` is prefer-light, `0` is no preference (treated as
+dark). Out of the box on most setups this is served by
+`xdg-desktop-portal-gtk`, which proxies the `org.gnome.desktop.interface
+color-scheme` gsettings key.
+
+To drive it from [darkman](https://gitlab.com/WhyNotHugo/darkman), either
+register darkman as the Settings backend:
+
+```ini
+# ~/.config/xdg-desktop-portal/portals.conf
+[preferred]
+org.freedesktop.impl.portal.Settings=darkman
+```
+
+or, to leave the portal backend alone, have darkman set the gsettings key that
+the gtk portal already republishes — a script in `~/.local/share/dark-mode.d/`
+and `~/.local/share/light-mode.d/` running:
+
+```bash
+gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'   # or 'prefer-light'
+```
+
+Neither approach needs any change on this daemon's side. Either way it
+re-tones the current cover in place: same hues, different lightness envelope.
+
 ## Tuning
 
-Color feel is controlled by constants at the top of
-`mpris_chroma/colors.py`:
+Color feel is controlled by constants in `mpris_chroma/tone.py` (toning and
+separation) and `mpris_chroma/colors.py` (ranking and selection). Lightness and
+chroma are in [Oklab](https://bottosson.github.io/posts/oklab/), so a lightness
+target means apparent brightness rather than HSV's `value`.
 
-| Constant | Meaning | Default |
-|----------|---------|---------|
-| `S_MIN` | minimum saturation (lifts drab covers) | `0.45` |
-| `V_MIN` / `V_MAX` | value band (visible, not blown out) | `0.45` / `0.85` |
-| `BANDS` | value band per theme mode (`dark` = `V_MIN`/`V_MAX`) | light: `0.70` / `0.97` |
-| `NEUTRAL_S` | saturation at or below which grayscale stays untinted | `0.12` |
-| `COLOR_MIN_DIST` | minimum RGB distance between selected colors | `0.12` |
-| `VIBRANCY_WEIGHT` | chroma bonus vs. pixel coverage in ranking (`0.0` = most-pixels-wins) | `0.5` |
-| `VIBRANCY_MIN_POP` | coverage below this gets no vibrancy boost (noise guard) | `0.01` |
+| Constant | Meaning | Dark | Light |
+|----------|---------|------|-------|
+| `ENVELOPES` | Oklab lightness envelope per mode | `0.15`–`0.55` | `0.55`–`0.92` |
+| `GAMMA` | compression exponent across covers (`<1` pulls bright covers down) | `0.85` | `1.18` |
+| `SPREAD_GAIN` | how much of a cover's own lightness spread survives (`1.0` = all) | `1.0` | `1.0` |
+| `CHROMA_FRAC` | target chroma as a fraction of the in-gamut ceiling | `0.85` | `0.85` |
+| `NEUTRAL_C` | chroma at or below which a slot stays grey (never tinted) | `0.02` | `0.02` |
+| `MIN_DE` | minimum perceptual distance between two slots | `0.10` | `0.10` |
+| `MAX_SEPARATION_SHIFT` | most one slot may be moved to resolve a collision | `0.04` | `0.04` |
+| `MAX_SEPARATION_PASSES` | separation attempts before giving up — a real stopping point, not just a backstop: a clamped move can be smaller than a full step, so a run can burn through all its passes with displacement budget still unspent | `8` | `8` |
+| `SELECT_MIN_DE` | minimum distance between two *source* picks (`colors.py`) | `0.08` | `0.08` |
+| `VIBRANCY_WEIGHT` | chroma bonus vs. pixel coverage in ranking (`0.0` = most-pixels-wins) | `0.5` | `0.5` |
+| `VIBRANCY_MIN_POP` | coverage below this gets no vibrancy boost (noise guard) | `0.01` | `0.01` |
+
+The dark envelope and gamma are fitted against `witch_hour`, the palette
+actually configured in this setup, and validated across a corpus of roughly
+193 real covers: mean screen luminance through wlchroma's real 12-cell ramp
+comes out to a median of **0.063**, against **0.223** for the pre-rework HSV
+behavior and **0.075** for `witch_hour` itself — dark output now lands near
+the reference instead of well past it. The light envelope and gamma have no
+equivalent reference palette to fit against; they're a provisional seed
+reasoned from symmetry with the dark side and should be expected to move once
+someone reviews them by eye, unlike the dark constants above.
+
+`tools/palette_lab.py` walks a corpus of real covers and A/Bs candidate
+parameter sets live through `wlchroma-ctl`, which is how these were chosen.
+Candidates: `legacy` (the pre-rework HSV algorithm, reproduced lab-only for
+before/after comparison), `oklab-v1`, `oklab-darker`, `oklab-vivid`,
+`oklab-yellowlift`. Run `tools/palette_lab.py --list` to see them, `--replay`
+to re-score recorded verdicts against a change, and `--holdout N` to reserve
+covers that tuning never sees.
 
 ## Tests
 
