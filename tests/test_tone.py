@@ -71,7 +71,7 @@ class ToneTest(unittest.TestCase):
         # A clamp-only implementation would pin all three slots at `hi` and
         # destroy the spread; compression seats the anchor below the ceiling
         # and keeps the slots apart.
-        lo, hi = ENVELOPES["dark"]
+        _, hi = ENVELOPES["dark"]
         src = [_lch("#f2f2f2"), _lch("#e8e8e8"), _lch("#fafafa")]
         out = tone.tone(src, "dark")
         pinned = sum(1 for s in out if s.L >= hi - 1e-9)
