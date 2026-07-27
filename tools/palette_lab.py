@@ -5,12 +5,13 @@ Visual acceptance cannot be asserted in a test, so this drives the real
 wlchroma-ctl over a corpus of real covers and records which candidate the user
 prefers per cover. No daemon, no D-Bus, no threads — cover in, palette out.
 
-    tools/palette_lab.py --a current --b oklab-v1
+    tools/palette_lab.py --a legacy --b oklab-v1
     tools/palette_lab.py --list
     tools/palette_lab.py --replay        # re-score recorded verdicts
 """
 
 import argparse
+import colorsys
 import hashlib
 import json
 import subprocess
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mpris_chroma import oklab, ramp                       # noqa: E402
 from mpris_chroma.apply import apply_wlchroma, revert_wlchroma, CtlError  # noqa: E402
-from mpris_chroma.colors import _histogram, _select, extract_colors  # noqa: E402
+from mpris_chroma.colors import _histogram, _select, _vibrancy_score  # noqa: E402
 from mpris_chroma import tone as tone_mod                  # noqa: E402
 
 CORPUS_DIRS = [Path.home() / ".local/share/jellyfin-tui/covers",
@@ -35,6 +36,72 @@ VERDICTS = Path(__file__).resolve().parent / "verdicts.json"
 # decode (SEC-005) — every slot identical, so it can never arise from a real
 # extraction (selection always rejects near-duplicate picks at SELECT_MIN_DE).
 _FALLBACK = ("#a48ec7",) * 3
+
+
+# --- Historical reproduction, lab-only -------------------------------------
+# Pre-rework HSV pipeline, reproduced verbatim from mpris_chroma/colors.py at
+# git commit 4ac796d (before the Oklab tone/separate rework). Kept ONLY so the
+# lab has a real "before" to put next to "after" — it is not, and must never
+# become, part of mpris_chroma/. These constants and functions were removed
+# from the shipped pipeline on purpose; do not re-add them there.
+_LEGACY_S_MIN = 0.45            # saturation floor for pixels that already have a hue
+_LEGACY_V_MIN, _LEGACY_V_MAX = 0.45, 0.85
+_LEGACY_NEUTRAL_S = 0.12        # at/below this, a pixel is neutral: not enriched
+_LEGACY_COLOR_MIN_DIST = 0.12   # min RGB distance between the three chosen slots
+_LEGACY_BANDS = {"dark": (_LEGACY_V_MIN, _LEGACY_V_MAX), "light": (0.70, 0.97)}
+
+
+def _legacy_clamp_hsv(h: float, s: float, v: float,
+                       mode: str = "dark") -> tuple[float, float, float]:
+    v_min, v_max = _LEGACY_BANDS[mode]
+    v = min(max(v, v_min), v_max)
+    if s > _LEGACY_NEUTRAL_S:
+        s = max(s, _LEGACY_S_MIN)
+    return h, s, v
+
+
+def _legacy_hex_of(h: float, s: float, v: float) -> str:
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def _legacy_rgb_dist(a: tuple[float, float, float],
+                      b: tuple[float, float, float]) -> float:
+    """Euclidean distance between two HSV colors in RGB space (0-1/channel)."""
+    ra, ga, ba = colorsys.hsv_to_rgb(*a)
+    rb, gb, bb = colorsys.hsv_to_rgb(*b)
+    return ((ra - rb) ** 2 + (ga - gb) ** 2 + (ba - bb) ** 2) ** 0.5
+
+
+def _legacy_extract(hist: list[tuple[int, tuple[float, float, float]]],
+                     mode: str) -> tuple[str, str, str]:
+    """Pre-rework selection and render, byte-for-byte from commit 4ac796d.
+
+    `hist` is assumed non-empty — the caller (`render`) applies the shared
+    undecodable-cover check before branching here, same as the new path, so
+    a corrupted cover is labeled "corrupt" under both candidates rather than
+    silently handed a fabricated palette by either one.
+
+    Selection always ranked and compared in the "dark" band regardless of
+    `mode` (narrower bands shrink RGB distances enough to swap which colors
+    get picked, which would mean a theme flip changes hue — not just
+    brightness). Only the final render below uses `mode`.
+    """
+    total = sum(count for count, _ in hist)
+    ranked = sorted(hist, key=lambda e: _vibrancy_score(e[0], total, e[1]),
+                    reverse=True)
+    picked: list[tuple[float, float, float]] = []
+    for _, hsv in ranked:
+        if len(picked) == 3:
+            break
+        lifted = _legacy_clamp_hsv(*hsv)   # default mode="dark", by design above
+        if all(_legacy_rgb_dist(lifted, _legacy_clamp_hsv(*p)) >= _LEGACY_COLOR_MIN_DIST
+               for p in picked):
+            picked.append(hsv)
+    while len(picked) < 3:
+        picked.append(picked[-1])
+    return tuple(_legacy_hex_of(*_legacy_clamp_hsv(*p, mode=mode)) for p in picked)
+# --- end historical reproduction -------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +115,8 @@ class Candidate:
     k: float
     cfrac: float
     min_de: float
-    current: bool = False    # True = today's shipped behavior, for A/B baseline
+    legacy: bool = False      # True = route to _legacy_extract (the pre-rework
+                              # HSV path, above); False = the tone/separate path
     yellow_assist: float = 0.0
     """Spec §11's deferred knob, off by default. Above zero, lifts lightness for
     hues whose in-gamut chroma ceiling is low — yellows and cyans, which read
@@ -60,7 +128,7 @@ class Candidate:
 
 CANDIDATES = {
     c.name: c for c in [
-        Candidate("current", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, current=True),
+        Candidate("legacy", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, legacy=True),
         Candidate("oklab-v1", 0.15, 0.55, 0.85, 1.0, 0.85, 0.10),
         Candidate("oklab-darker", 0.10, 0.50, 0.75, 1.0, 0.85, 0.10),
         Candidate("oklab-vivid", 0.15, 0.55, 0.85, 1.0, 0.95, 0.10),
@@ -101,8 +169,8 @@ def render(path: Path, cand: Candidate, mode: str):
     hist = _histogram(path)
     if not hist:
         return _FALLBACK, "corrupt"
-    if cand.current:
-        return extract_colors(path, mode=mode), None
+    if cand.legacy:
+        return _legacy_extract(hist, mode), None
     picked, n = _select(hist)
     # Patch the module constants for this render only, then restore: the lab
     # exists to compare parameter sets, and the pipeline reads them as globals.
@@ -178,7 +246,7 @@ def _stop_viewer(viewer) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--a", default="current", choices=sorted(CANDIDATES))
+    ap.add_argument("--a", default="legacy", choices=sorted(CANDIDATES))
     ap.add_argument("--b", default="oklab-v1", choices=sorted(CANDIDATES))
     ap.add_argument("--mode", default="dark", choices=("dark", "light"))
     ap.add_argument("--holdout", type=int, default=25)
@@ -191,7 +259,8 @@ def main() -> int:
         for c in CANDIDATES.values():
             print("%-14s lo=%.2f hi=%.2f g=%.2f k=%.2f cfrac=%.2f min_de=%.2f%s"
                   % (c.name, c.lo, c.hi, c.gamma, c.k, c.cfrac, c.min_de,
-                     "   (shipped behavior)" if c.current else ""))
+                     "   (pre-rework HSV baseline, commit 4ac796d)"
+                     if c.legacy else ""))
         return 0
 
     verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
