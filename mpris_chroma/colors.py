@@ -4,31 +4,27 @@ from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 
+from . import oklab
+from .tone import separate, tone
+
 # Library-style logger: a NullHandler keeps it silent unless the application
 # configures logging (sync.main does), so a cover that cannot be turned into a
 # palette is diagnosable instead of silently becoming the default accent.
 _log = logging.getLogger("mpris_chroma.colors")
 _log.addHandler(logging.NullHandler())
 
-S_MIN = 0.45          # saturation floor for pixels that already have a hue
-V_MIN = 0.45          # value floor: lift near-black enough to be visible
-V_MAX = 0.85          # value ceiling: keep bright colors from blowing out
-NEUTRAL_S = 0.12      # at/below this saturation a pixel is treated as neutral
-                      # (grayscale) and its saturation is NOT enriched
-COLOR_MIN_DIST = 0.12  # min RGB distance between the three chosen slots
-
 VIBRANCY_WEIGHT = 0.5   # how much chroma (s*v) counts vs. pixel coverage;
                         # 0.0 restores pure most-pixels-wins ranking
 VIBRANCY_MIN_POP = 0.01  # coverage below this gets no vibrancy boost, so a
                          # vivid noise speck can't jump the queue
 
-# Value band per theme mode. Hue and saturation always come from the cover;
-# light-vs-dark only remaps how bright the palette lands. "dark" is the
-# historical band; "light" lifts it so colors read on a light desktop theme.
-BANDS = {
-    "dark": (V_MIN, V_MAX),
-    "light": (0.70, 0.97),
-}
+# Minimum perceptual distance between two *source* picks. Selection has to
+# reject three shades of one color before toning, or stage 4 is handed a
+# collision it cannot solve. Measured on source colors, so it is
+# mode-independent — mode must only re-tone the same three picks, never change
+# which ones they are. Below tone.MIN_DE because toning compresses distances.
+SELECT_MIN_DE = 0.08
+
 # Album artwork is only ever a raster photo; SVG/PDF/HTML and other formats are
 # unnecessary and expand the decoder attack surface. Only these three formats
 # (identified by Pillow from the file's *signature*, never its extension) may be
@@ -47,23 +43,6 @@ _QUANTIZE_COLORS = 16  # palette size, mirrors the old `-colors 16`
 _MAX_DECODE_BYTES = 16 * 1024 * 1024  # 16 MiB; bounds local covers, which are
                                       # not size-capped by the download path
 _MAX_PIXELS = 16_000_000              # ~16 MP declared-dimension ceiling
-
-
-def clamp_hsv(h: float, s: float, v: float,
-              mode: str = "dark") -> tuple[float, float, float]:
-    """Lift value into the mode's visible band; enrich saturation only for
-    pixels that already have a hue, so genuine neutrals (grayscale) are left
-    untinted. Hue is never touched — mode only moves the brightness band."""
-    v_min, v_max = BANDS[mode]
-    v = min(max(v, v_min), v_max)
-    if s > NEUTRAL_S:
-        s = max(s, S_MIN)
-    return h, s, v
-
-
-def hex_of(h: float, s: float, v: float) -> str:
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
 
 
 def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]:
@@ -121,23 +100,48 @@ def _vibrancy_score(count: int, total: int,
     return frac + VIBRANCY_WEIGHT * s * v
 
 
-def _rgb_dist(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-    """Euclidean distance between two HSV colors in RGB space (0-1 per channel)."""
-    ra, ga, ba = colorsys.hsv_to_rgb(*a)
-    rb, gb, bb = colorsys.hsv_to_rgb(*b)
-    return ((ra - rb) ** 2 + (ga - gb) ** 2 + (ba - bb) ** 2) ** 0.5
+def _select(hist: list[tuple[int, tuple[float, float, float]]]
+            ) -> tuple[list[tuple[float, float, float]], int]:
+    """Rank the histogram and pick up to three distinct source colors.
+
+    Returns the picks as OkLCh plus how many of them are *real* — fewer than
+    three means the cover had fewer distinct colors and the list was padded by
+    repeating the last, which separation must know so it never gives a solid
+    cover contrast it does not have.
+
+    Deliberately takes no `mode`: mode may only re-tone the same three picks,
+    never change which ones they are, and the cheapest way to guarantee that is
+    to make it impossible to express.
+    """
+    total = sum(count for count, _ in hist)
+    # Most apparent first, vibrancy-aware: coverage plus a chroma bonus, so a
+    # small vivid accent (a logo, a face) can beat a large drab background.
+    ranked = sorted(hist, key=lambda e: _vibrancy_score(e[0], total, e[1]),
+                    reverse=True)
+    picked: list[tuple[float, float, float]] = []
+    for _, hsv in ranked:
+        if len(picked) == 3:
+            break
+        lch = oklab.to_lch(*oklab.srgb_to_oklab(*colorsys.hsv_to_rgb(*hsv)))
+        if all(oklab.delta_e(oklab.from_lch(*lch), oklab.from_lch(*p))
+               >= SELECT_MIN_DE for p in picked):
+            picked.append(lch)
+    n_distinct = len(picked)
+    # Repeat the last real color rather than fabricate a hue that isn't there.
+    while len(picked) < 3:
+        picked.append(picked[-1])
+    return picked, n_distinct
 
 
 def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]:
     """Extract the three most prominent, visibly distinct colors from an image.
 
-    Faithful to the cover: colors are ranked by how much of the image they cover
-    (the most *apparent* colors), then clamped only for visibility — value is
-    lifted into a readable band and saturation is enriched, but saturation is
-    left alone for near-neutral pixels so a grayscale cover stays grayscale
-    rather than being tinted. No hues are ever invented; the three slots are real
-    cover colors, kept apart by at least COLOR_MIN_DIST. If the cover has fewer
-    than three distinct colors, the last one is repeated.
+    Faithful to the cover: colors are ranked by coverage plus a vibrancy bonus,
+    then toned into the mode's Oklab lightness envelope — compressed relative to
+    other covers, but keeping this cover's own spread — and finally pushed apart
+    if two of them collide perceptually. No hues are ever invented; the three
+    slots are real cover colors. If the cover has fewer than three distinct
+    colors, the last one is repeated rather than fabricated.
     """
     hist = _histogram(image_path)
     if not hist:
@@ -148,28 +152,11 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
                      image_path.name)
         return "#a48ec7", "#a48ec7", "#a48ec7"
 
-    # Most apparent first, vibrancy-aware: coverage plus a chroma bonus, so
-    # a small vivid accent (a logo, a face) can beat a large drab background.
-    total = sum(count for count, _ in hist)
-    ranked = sorted(hist, key=lambda e: _vibrancy_score(e[0], total, e[1]),
-                    reverse=True)
-
-    # Select in the historical dark band regardless of mode: light's narrower
-    # band shrinks RGB distances, and re-selecting there can swap in a
-    # different cover color — changing a hue on a theme flip. Mode must only
-    # move the brightness of the SAME three picks.
-    picked: list[tuple[float, float, float]] = []
-    for _, hsv in ranked:
-        if len(picked) == 3:
-            break
-        lifted = clamp_hsv(*hsv)
-        if all(_rgb_dist(lifted, clamp_hsv(*p)) >= COLOR_MIN_DIST for p in picked):
-            picked.append(hsv)
-
-    # Fewer than three distinct colors in the cover: repeat the last real one
-    # rather than fabricate a hue that isn't there.
-    while len(picked) < 3:
-        picked.append(picked[-1])
-
-    c1, c2, c3 = (hex_of(*clamp_hsv(*p, mode=mode)) for p in picked)
-    return c1, c2, c3
+    picked, n_distinct = _select(hist)
+    toned = tone(picked, mode)
+    slots, result = separate(toned, mode, n_distinct)
+    if not result.resolved and result.reason != "duplicates":
+        # An unseparable palette is an accepted outcome, but never a silent one.
+        _log.debug("palette for %s left a pair at dE %.3f (%s)",
+                   image_path.name, result.residual_de, result.reason)
+    return tuple(slot.to_hex() for slot in slots)

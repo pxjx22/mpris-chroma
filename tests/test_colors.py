@@ -8,9 +8,10 @@ from PIL import Image
 
 from mpris_chroma import colors
 from mpris_chroma.colors import (
-    clamp_hsv, hex_of, extract_colors, S_MIN, V_MIN, V_MAX, NEUTRAL_S,
-    BANDS, VIBRANCY_WEIGHT, VIBRANCY_MIN_POP, _vibrancy_score,
+    extract_colors, VIBRANCY_WEIGHT, VIBRANCY_MIN_POP, _vibrancy_score,
 )
+from mpris_chroma import oklab, ramp
+from mpris_chroma.tone import ENVELOPES, NEUTRAL_C, MIN_DE
 
 
 def _rgb(hexc: str) -> tuple[int, int, int]:
@@ -39,61 +40,6 @@ def _thirds(path: Path, a: str, b: str, c: str):
 def _hsv(hexc: str):
     r, g, b = (int(hexc[i:i + 2], 16) / 255 for i in (1, 3, 5))
     return colorsys.rgb_to_hsv(r, g, b)
-
-
-class ClampTest(unittest.TestCase):
-    def test_clamp_enriches_colored_pixel(self):
-        # A pixel that already has a hue gets its saturation lifted.
-        _, s, _ = clamp_hsv(0.5, 0.20, 0.6)
-        self.assertGreaterEqual(s, S_MIN)
-
-    def test_clamp_leaves_neutral_untinted(self):
-        # A near-neutral (grayscale) pixel keeps its low saturation — no fake color.
-        _, s, _ = clamp_hsv(0.0, 0.03, 0.6)
-        self.assertLess(s, S_MIN)
-        self.assertLessEqual(s, NEUTRAL_S)
-
-    def test_clamp_bounds_value(self):
-        _, _, vlo = clamp_hsv(0.5, 0.8, 0.05)
-        _, _, vhi = clamp_hsv(0.5, 0.8, 0.99)
-        self.assertGreaterEqual(vlo, V_MIN)
-        self.assertLessEqual(vhi, V_MAX)
-
-    def test_hex_of_roundtrips_format(self):
-        self.assertEqual(hex_of(0.0, 1.0, 1.0), "#ff0000")
-
-
-class ModeBandTest(unittest.TestCase):
-    def test_dark_band_matches_legacy_constants(self):
-        # "dark" is the historical behavior; keep it bit-identical.
-        self.assertEqual(BANDS["dark"], (V_MIN, V_MAX))
-
-    def test_light_band_sits_above_dark(self):
-        lo_d, hi_d = BANDS["dark"]
-        lo_l, hi_l = BANDS["light"]
-        self.assertGreater(lo_l, lo_d)
-        self.assertGreater(hi_l, hi_d)
-
-    def test_clamp_light_mode_lifts_value_higher(self):
-        _, _, v_dark = clamp_hsv(0.5, 0.8, 0.05, mode="dark")
-        _, _, v_light = clamp_hsv(0.5, 0.8, 0.05, mode="light")
-        self.assertGreaterEqual(v_light, BANDS["light"][0])
-        self.assertGreater(v_light, v_dark)
-
-    def test_clamp_light_mode_caps_at_light_ceiling(self):
-        _, _, v = clamp_hsv(0.5, 0.8, 0.99, mode="light")
-        self.assertLessEqual(v, BANDS["light"][1])
-
-    def test_clamp_default_mode_is_dark(self):
-        # Callers that never pass a mode keep today's behavior exactly.
-        self.assertEqual(clamp_hsv(0.5, 0.8, 0.05),
-                         clamp_hsv(0.5, 0.8, 0.05, mode="dark"))
-
-    def test_mode_never_changes_hue(self):
-        h_dark, _, _ = clamp_hsv(0.33, 0.8, 0.5, mode="dark")
-        h_light, _, _ = clamp_hsv(0.33, 0.8, 0.5, mode="light")
-        self.assertEqual(h_dark, 0.33)
-        self.assertEqual(h_light, 0.33)
 
 
 class VibrancyScoreTest(unittest.TestCase):
@@ -140,19 +86,24 @@ class ExtractTest(unittest.TestCase):
             int(c[1:], 16)  # parses as hex
 
     def test_dark_colored_cover_is_lifted_to_readable(self):
+        # Was: saturation >= S_MIN and value >= V_MIN. The intent survives —
+        # a dark but genuinely red cover must come out visible and still red —
+        # but it is now stated in the space the pipeline actually works in.
         img = self.tmp / "dark.png"
-        _solid(img, "#3a0d0d")  # dark but genuinely red (has a hue)
+        _solid(img, "#3a0d0d")
         c1, _, _ = extract_colors(img)
-        _, s, v = _hsv(c1)
-        self.assertGreaterEqual(s, S_MIN)   # colored -> saturation enriched
-        self.assertGreaterEqual(v, V_MIN)   # dark    -> value lifted
+        L, C, _ = oklab.hex_to_lch(c1)
+        lo, hi = ENVELOPES["dark"]
+        self.assertGreaterEqual(L, lo - 1e-9)
+        self.assertLessEqual(L, hi + 1e-9)
+        self.assertGreater(C, NEUTRAL_C)
 
     def test_grayscale_cover_stays_neutral(self):
         # The regression: a grayscale cover must NOT be tinted into fake colors.
         img = self.tmp / "gray.png"
         _thirds(img, "#202020", "#808080", "#d0d0d0")
         for c in extract_colors(img):
-            self.assertLess(_hsv(c)[1], S_MIN)  # every slot stays near-neutral
+            self.assertLess(oklab.hex_to_lch(c)[1], NEUTRAL_C)
 
     def test_two_tone_cover_yields_distinct_hues(self):
         img = self.tmp / "two.png"
@@ -169,32 +120,18 @@ class ExtractTest(unittest.TestCase):
         self.assertNotEqual(c1, c3)
 
     def test_light_mode_same_hues_brighter_values(self):
-        # Light mode remaps only the value band: hue comes from the cover
-        # either way, but every slot lands in the light band.
+        # Light mode remaps only lightness: hues come from the cover either way,
+        # and every slot lands in the light envelope.
         img = self.tmp / "lm.png"
         _thirds(img, "#e01010", "#10e010", "#1010e0")
         dark = extract_colors(img, mode="dark")
         light = extract_colors(img, mode="light")
         for cd, cl in zip(dark, light):
-            self.assertAlmostEqual(_hsv(cd)[0], _hsv(cl)[0], places=1)
+            self.assertAlmostEqual(oklab.hex_to_lch(cd)[2],
+                                   oklab.hex_to_lch(cl)[2], places=1)
+        lo, _ = ENVELOPES["light"]
         for cl in light:
-            self.assertGreaterEqual(_hsv(cl)[2], BANDS["light"][0] - 0.01)
-
-    def test_mode_switch_never_changes_which_colors_are_picked(self):
-        # Regression: light's narrower band shrinks RGB distances, so a color
-        # that passed COLOR_MIN_DIST in dark can collide in light — re-running
-        # selection then swaps in a different cover color, changing a hue on a
-        # theme flip. Selection must happen once; only the band moves.
-        hist = [
-            (100, (0.70, 0.60, 0.30)),  # dominant purple, dark
-            (50, (0.70, 0.60, 0.62)),   # same hue, brighter: distinct only in dark band
-            (10, (0.10, 0.80, 0.50)),   # orange that sneaks in if light re-selects
-        ]
-        with mock.patch.object(colors, "_histogram", return_value=hist):
-            dark = extract_colors(Path("unused"), mode="dark")
-            light = extract_colors(Path("unused"), mode="light")
-        for cd, cl in zip(dark, light):
-            self.assertAlmostEqual(_hsv(cd)[0], _hsv(cl)[0], places=2)
+            self.assertGreaterEqual(oklab.hex_to_lch(cl)[0], lo - 1e-9)
 
     def test_small_vivid_accent_makes_the_palette(self):
         # The dominance failure mode: three drab regions own the pixel count,
@@ -216,6 +153,97 @@ class ExtractTest(unittest.TestCase):
         c1, c2, c3 = extract_colors(img)
         self.assertEqual(c1, c2)
         self.assertEqual(c2, c3)
+
+
+# Widest Oklab hue shift attributable purely to 8-bit output quantization,
+# measured across this fixture in both modes (worst observed 0.0073 rad). This
+# is 0.16% of the hue circle — about three times tighter than the tolerance the
+# original HSV form of this test used, and it measures the right quantity.
+HUE_QUANTIZATION_TOLERANCE = 0.01
+
+
+class ModeIndependenceTest(unittest.TestCase):
+    """Selection must run once, mode-free; only the lightness envelope moves.
+    Re-selecting per mode can swap in a different cover color and change a hue
+    on a theme flip."""
+
+    def test_selection_takes_no_mode_at_all(self):
+        # The invariant held structurally: if _select cannot see the mode, it
+        # cannot vary by it. Stronger than any behavioral sample.
+        import inspect
+        self.assertNotIn("mode", inspect.signature(colors._select).parameters)
+
+    def test_both_modes_tone_the_same_picked_hues(self):
+        # Asserted in Oklab hue, which the pipeline holds genuinely fixed. The
+        # original compared HSV hue, but a fixed Oklab hue converts back to
+        # different HSV hues at different lightnesses — measured drift 0.0286
+        # against its own 0.005 tolerance. The old metric reported a hue change
+        # that never happened; this one measures what actually must not move.
+        hist = [
+            (100, (0.70, 0.60, 0.30)),  # dominant purple, dark
+            (50, (0.70, 0.60, 0.62)),   # same hue, brighter
+            (10, (0.10, 0.80, 0.50)),   # orange that sneaks in if light re-selects
+        ]
+        picks, _ = colors._select(hist)
+        with mock.patch.object(colors, "_histogram", return_value=hist):
+            dark = extract_colors(Path("unused"), mode="dark")
+            light = extract_colors(Path("unused"), mode="light")
+        for src, cd, cl in zip(picks, dark, light):
+            for out in (cd, cl):
+                with self.subTest(color=out):
+                    delta = abs(oklab.hex_to_lch(out)[2] - src[2])
+                    self.assertLess(delta, HUE_QUANTIZATION_TOLERANCE)
+
+
+class PipelineInvariantTest(unittest.TestCase):
+    """Properties of the whole extract path that no single stage owns."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_distinct_cover_yields_separated_slots(self):
+        img = self.tmp / "d.png"
+        _thirds(img, "#d1a973", "#b89265", "#9d7156")   # three tans: a collision
+        labs = [oklab.from_lch(*oklab.hex_to_lch(c)) for c in extract_colors(img)]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                with self.subTest(pair=(i, j)):
+                    self.assertGreaterEqual(oklab.delta_e(labs[i], labs[j]),
+                                            MIN_DE - 1e-9)
+
+    def test_bright_cover_no_longer_washes_out(self):
+        # The defect this work exists to fix, asserted end to end.
+        img = self.tmp / "bright.png"
+        _thirds(img, "#f2f2f2", "#e8e8e8", "#fafafa")
+        self.assertLess(ramp.mean_luminance(*extract_colors(img, mode="dark")), 0.25)
+
+    def test_every_slot_is_in_gamut(self):
+        img = self.tmp / "g.png"
+        _thirds(img, "#ffee00", "#00e5ff", "#1010e0")   # low-ceiling hues
+        # This yellow's chroma is pinned to the exact max_chroma boundary at
+        # light mode's L~0.92 (chroma_for has zero margin once the source
+        # exceeds the ceiling). Verified directly on the pipeline's own Toned
+        # slot (pre-hex), that point IS in_gamut. But this test checks the
+        # public contract -- the returned *hex string* -- and re-deriving Lab
+        # from an 8-bit hex re-parse reintroduces floating-point noise (worst
+        # measured: -1.30e-7 on the linear channel nearest zero, for #ffff00 at
+        # this L) that straddles oklab.in_gamut's 1e-7 epsilon. That epsilon is
+        # tuned for max_chroma's bisection, not for hex round-trips, so a
+        # genuinely valid boundary color can read back as a hair "outside".
+        # GAMUT_EPS (1e-6, ~130x that noise) absorbs it while still catching
+        # a real violation: chroma pushed 0.01 over the ceiling -- the margin
+        # tone.py's own boundary test uses -- fails even with this tolerance.
+        GAMUT_EPS = 1e-6
+        for mode in ("dark", "light"):
+            for c in extract_colors(img, mode=mode):
+                with self.subTest(mode=mode, color=c):
+                    L, C, h = oklab.hex_to_lch(c)
+                    self.assertTrue(
+                        oklab.in_gamut(*oklab.from_lch(L, max(C - GAMUT_EPS, 0.0), h)))
 
 
 DEFAULT_ACCENT = "#a48ec7"  # the pathological/rejected fallback triple
