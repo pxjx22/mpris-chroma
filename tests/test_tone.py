@@ -128,5 +128,119 @@ class TonedRecordTest(unittest.TestCase):
         self.assertLessEqual(low.C, oklab.max_chroma(0.15, h) + 1e-9)
 
 
+class SeparationTest(unittest.TestCase):
+    def _collide(self, mode="dark"):
+        # Three tans that the old RGB distance check passed: a real collision
+        # from the corpus, not a synthetic one.
+        src = [_lch("#d1a973"), _lch("#b89265"), _lch("#9d7156")]
+        return tone.tone(src, mode)
+
+    def test_collision_is_separated(self):
+        slots, result = tone.separate(self._collide(), "dark", 3)
+        labs = [s.to_lab() for s in slots]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                with self.subTest(pair=(i, j)):
+                    self.assertGreaterEqual(oklab.delta_e(labs[i], labs[j]),
+                                            tone.MIN_DE - 1e-9)
+        self.assertTrue(result.resolved)
+        self.assertEqual(result.reason, "clear")
+
+    def test_already_distinct_palette_is_untouched(self):
+        before = tone.tone([_lch("#e01050"), _lch("#10e050"), _lch("#5010e0")], "dark")
+        after, result = tone.separate(before, "dark", 3)
+        for a, b in zip(before, after):
+            self.assertEqual(a.L, b.L)
+        self.assertEqual(result.reason, "clear")
+
+    def test_hue_is_never_modified(self):
+        before = self._collide()
+        after, _ = tone.separate(before, "dark", 3)
+        for a, b in zip(before, after):
+            self.assertAlmostEqual(a.h, b.h, places=12)
+
+    def test_no_slot_moves_beyond_the_displacement_budget(self):
+        # The bound on separation's departure from source fidelity (spec §6).
+        before = self._collide()
+        after, _ = tone.separate(before, "dark", 3)
+        for a, b in zip(before, after):
+            self.assertLessEqual(abs(a.L - b.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
+
+    def test_no_slot_crosses_a_neighbour(self):
+        # Without the neighbour clamp a slot can be pushed past a third slot and
+        # invert the ordering that mode-independence relies on.
+        before = self._collide()
+        order = sorted(range(3), key=lambda i: before[i].L)
+        after, _ = tone.separate(before, "dark", 3)
+        ranked = [after[i].L for i in order]
+        self.assertEqual(ranked, sorted(ranked))
+
+    def test_output_stays_inside_the_envelope(self):
+        lo, hi = ENVELOPES["dark"]
+        after, _ = tone.separate(self._collide(), "dark", 3)
+        for slot in after:
+            self.assertGreaterEqual(slot.L, lo - 1e-9)
+            self.assertLessEqual(slot.L, hi + 1e-9)
+
+    def test_duplicate_slots_are_never_separated(self):
+        # A solid cover repeats its one real color; separating it would make the
+        # cover appear to have contrast it does not have.
+        src = [_lch("#c81e5a")] * 3
+        toned = tone.tone(src, "dark")
+        after, result = tone.separate(toned, "dark", 1)
+        self.assertEqual(after[0].L, after[1].L)
+        self.assertEqual(after[1].L, after[2].L)
+        self.assertEqual(result.reason, "duplicates")
+        self.assertFalse(result.resolved)
+
+    def test_two_distinct_slots_separate_and_the_pad_follows(self):
+        src = [_lch("#d1a973"), _lch("#b89265")]
+        toned = tone.tone(src, "dark") + [tone.tone(src, "dark")[-1]]
+        after, _ = tone.separate(toned, "dark", 2)
+        self.assertEqual(after[1].L, after[2].L)   # pad still mirrors slot 2
+
+    def test_monochrome_collision_reports_rather_than_forcing(self):
+        # Two colors that are the same hue and nearly the same lightness cannot
+        # be pushed apart within budget; that is the correct outcome, but it has
+        # to be observable rather than silent.
+        src = [_lch("#4a4a4a"), _lch("#4b4b4b"), _lch("#4c4c4c")]
+        _, result = tone.separate(tone.tone(src, "dark"), "dark", 3)
+        self.assertFalse(result.resolved)
+        self.assertIn(result.reason, ("budget", "envelope", "passes"))
+        self.assertGreater(result.residual_de, 0.0)
+        self.assertLess(result.residual_de, tone.MIN_DE)
+
+    def test_budget_exhaustion_is_reported_distinctly(self):
+        # Each terminal condition must be reachable and correctly named, or the
+        # reason string is decoration rather than diagnosis. These two sit mid
+        # envelope with room to move, so "envelope" is ruled out and only the
+        # displacement budget can stop them.
+        lo, hi = ENVELOPES["dark"]
+        mid = (lo + hi) / 2
+        h = math.radians(29)
+        slots = [Toned(L=mid, h=h, c_src=0.05),
+                 Toned(L=mid + 0.001, h=h, c_src=0.05),
+                 Toned(L=mid + 0.002, h=h, c_src=0.05)]
+        after, result = tone.separate(slots, "dark", 3)
+        self.assertEqual(result.reason, "budget")
+        self.assertFalse(result.resolved)
+        for before, moved in zip(slots, after):
+            self.assertLess(abs(before.L - moved.L), lo)   # nowhere near a bound
+
+    def test_budget_binds_before_the_pass_cap(self):
+        # The two constants are not redundant: the displacement budget is the
+        # operative limit and the pass cap is only a loop safety net.
+        self.assertLess(tone.MAX_SEPARATION_SHIFT / tone.SEPARATION_STEP,
+                        tone.MAX_SEPARATION_PASSES)
+
+    def test_separation_terminates_in_light_mode_too(self):
+        after, result = tone.separate(self._collide("light"), "light", 3)
+        lo, hi = ENVELOPES["light"]
+        for slot in after:
+            self.assertGreaterEqual(slot.L, lo - 1e-9)
+            self.assertLessEqual(slot.L, hi + 1e-9)
+        self.assertIn(result.reason, ("clear", "budget", "envelope", "passes"))
+
+
 if __name__ == "__main__":
     unittest.main()

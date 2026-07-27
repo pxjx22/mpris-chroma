@@ -90,3 +90,116 @@ def tone(source_lch: list[tuple[float, float, float]], mode: str) -> list[Toned]
         moved = toned_anchor + SPREAD_GAIN * (L - anchor)
         out.append(Toned(L=min(hi, max(lo, moved)), h=h, c_src=C))
     return out
+
+
+# Perceptual distinctness (spec §6). Toning alone does not fix collisions and
+# slightly worsens them — compressing lightness pulls apart-in-L colors together
+# — so the repair runs after toning, where the collision actually appears.
+MIN_DE = 0.10                # pairs closer than this in Oklab read as duplicates
+SEPARATION_STEP = 0.01       # per-pass lightness nudge
+MAX_SEPARATION_SHIFT = 0.04  # total displacement any one slot may accumulate
+MAX_SEPARATION_PASSES = 8    # loop safety net; the budget above binds first
+_BUDGET_EPS = 1e-9           # float tolerance for "budget fully spent"; repeated
+                             # subtraction settles a few ulps above exact 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class SeparationResult:
+    """Why separation stopped. A palette that cannot be separated within budget
+    is an accepted outcome — for a genuinely monochrome cover it is the correct
+    one — but it must be observable rather than silent (SEC-019 precedent)."""
+
+    resolved: bool
+    reason: str          # clear | duplicates | envelope | budget | passes
+    residual_de: float   # closest remaining pair; MIN_DE or more when resolved
+
+
+def _closest_pair(slots: list[Toned]) -> tuple[int, int, float]:
+    labs = [s.to_lab() for s in slots]
+    best = (0, 1, float("inf"))
+    for i in range(len(slots)):
+        for j in range(i + 1, len(slots)):
+            d = oklab.delta_e(labs[i], labs[j])
+            if d < best[2]:
+                best = (i, j, d)
+    return best
+
+
+def separate(slots: list[Toned], mode: str,
+             n_distinct: int) -> tuple[list[Toned], SeparationResult]:
+    """Push colliding slots apart in lightness only, within bounds (spec §6).
+
+    Selection is never revisited — these are the same three cover colors, and
+    hue is untouched. Only the *real* picks participate: when a cover yielded
+    fewer than three distinct colors the extras are repeats, and separating them
+    would invent contrast the cover does not have.
+    """
+    lo, hi = ENVELOPES[mode]
+    if n_distinct < 2:
+        return list(slots), SeparationResult(False, "duplicates", 0.0)
+
+    work = list(slots[:n_distinct])
+    # Rank order is fixed once, here, and held for the rest of the routine. Every
+    # move is clamped against neighbours in this order, which is what makes
+    # monotonicity hold by construction: pushing a pair apart preserves that
+    # pair's order, but unclamped it could shove a slot past a *third* one.
+    order = sorted(range(n_distinct), key=lambda i: (work[i].L, i))
+    budget = [MAX_SEPARATION_SHIFT] * n_distinct
+    reason = "passes"
+
+    for _ in range(MAX_SEPARATION_PASSES):
+        i, j, dist = _closest_pair(work)
+        if dist >= MIN_DE:
+            reason = "clear"
+            break
+        # Move the higher-ranked slot of the pair up and the lower one down.
+        rank = {slot: pos for pos, slot in enumerate(order)}
+        up, down = (i, j) if rank[i] > rank[j] else (j, i)
+        moved = False
+        for idx, direction in ((up, +1.0), (down, -1.0)):
+            step = min(SEPARATION_STEP, budget[idx])
+            if step <= 0.0:
+                continue
+            target = work[idx].L + direction * step
+            # Three bounds: the envelope, the slot's remaining budget (already
+            # applied via `step`), and its immediate neighbours' current
+            # positions, so ranks can never swap.
+            pos = rank[idx]
+            if direction > 0 and pos + 1 < n_distinct:
+                target = min(target, work[order[pos + 1]].L)
+            if direction < 0 and pos - 1 >= 0:
+                target = max(target, work[order[pos - 1]].L)
+            target = min(hi, max(lo, target))
+            delta = abs(target - work[idx].L)
+            if delta <= 0.0:
+                continue
+            budget[idx] -= delta
+            work[idx] = Toned(L=target, h=work[idx].h, c_src=work[idx].c_src)
+            moved = True
+        if not moved:
+            # Nothing could move: either every slot is pinned at an envelope
+            # bound or every budget is spent. Distinguish the two so the reason
+            # is diagnostic rather than a catch-all. Repeated float subtraction
+            # rarely lands a spent budget on exact 0.0 (it settles a few ulps
+            # above), so this is a tolerance comparison, not an exact one.
+            reason = "budget" if all(b <= _BUDGET_EPS for b in budget) else "envelope"
+            break
+        if all(b <= _BUDGET_EPS for b in budget):
+            # Detect exhaustion the moment it happens rather than waiting for a
+            # following pass to confirm nothing moves: a pass that spends the
+            # last of every slot's budget still counts as "moved" above, so
+            # without this check a palette that exhausts budget on exactly the
+            # final permitted pass would fall through with no break ever fired,
+            # leaving `reason` at its "passes" default — mislabeling budget
+            # exhaustion as a pass-cap hit.
+            reason = "budget"
+            break
+
+    residual = _closest_pair(work)[2]
+    resolved = residual >= MIN_DE
+    if resolved:
+        reason = "clear"
+    # Re-pad: a cover with fewer than three real colors repeats its last one,
+    # and that repeat must keep tracking the slot it mirrors.
+    out = work + [work[-1]] * (len(slots) - n_distinct)
+    return out, SeparationResult(resolved, reason, residual)
