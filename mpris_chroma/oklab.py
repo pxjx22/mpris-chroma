@@ -50,15 +50,17 @@ def _to_linear_rgb(L: float, a: float, b: float) -> tuple[float, float, float]:
 
 
 def in_gamut(L: float, a: float, b: float) -> bool:
-    """True iff the color is representable in sRGB. The epsilon absorbs the
-    float error that would otherwise make an exactly-on-boundary color flicker
-    in and out of gamut between calls."""
+    """True iff the color is representable in sRGB. The epsilon (1e-7) is
+    empirical and prevents bisection from wandering at lightness extremes.
+    Loosening toward 1e-4 regresses test_max_chroma_vanishes_at_the_extremes."""
     return all(-1e-7 <= c <= 1 + 1e-7 for c in _to_linear_rgb(L, a, b))
 
 
 def oklab_to_srgb(L: float, a: float, b: float) -> tuple[float, float, float]:
-    return tuple(min(1.0, max(0.0, _to_gamma(min(1.0, max(0.0, c)))))
-                 for c in _to_linear_rgb(L, a, b))
+    r, g, b = _to_linear_rgb(L, a, b)
+    return (min(1.0, max(0.0, _to_gamma(min(1.0, max(0.0, r))))),
+            min(1.0, max(0.0, _to_gamma(min(1.0, max(0.0, g))))),
+            min(1.0, max(0.0, _to_gamma(min(1.0, max(0.0, b))))))
 
 
 def to_lch(L: float, a: float, b: float) -> tuple[float, float, float]:
