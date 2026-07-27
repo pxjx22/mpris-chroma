@@ -545,6 +545,50 @@ class LineValidationTest(unittest.TestCase):
         self.assertEqual(len(h.submitted), 1)
 
 
+class InactiveEventTest(unittest.TestCase):
+    """PERF-001 regression pins. The finding asked for cover work to be skipped
+    on inactive events; the 4b/4c reshape dissolved it — the coordinator decides
+    a desired END STATE from status before anything is scheduled, so a
+    non-playing player produces a revert or a hold and never a cover job. These
+    pin that in BOTH directions, on the submitted desires rather than on counts,
+    so the property cannot regress into 'submits nothing at all'."""
+
+    def test_pause_never_submits_a_cover_bearing_job(self):
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.on_line(_line("spotify", "Paused", "https://x/a"))
+        self.assertEqual(h.last[1], Desired(None, "dark"))   # revert, no target
+        self.assertEqual([d.target for _g, d in h.submitted[1:]], [None])
+
+    def test_stop_never_submits_a_cover_bearing_job(self):
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.on_line(_line("spotify", "Stopped", "https://x/a"))
+        self.assertEqual([d.target for _g, d in h.submitted[1:]], [None])
+
+    def test_resume_does_submit_the_cover(self):
+        # The other direction: skipping work on inactive events must not become
+        # skipping work altogether.
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.on_line(_line("spotify", "Paused", "https://x/a"))
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        self.assertEqual(h.last[1].target, CoverTarget("https://x/a", None))
+
+    def test_paused_dir_scan_player_does_not_trigger_a_dir_resubmit(self):
+        # The one resubmit-on-identical-line path in the codebase (dir-scan
+        # identities are unstable, so a repeat LINE re-reads the directory) must
+        # fire only for a Playing winner — otherwise a paused player's repeated
+        # lines would each schedule a directory scan.
+        h = _Harness()
+        h.coord.on_line(_line("jellyfin-tui", "Playing", ""))
+        h.coord.on_line(_line("jellyfin-tui", "Paused", ""))
+        before = len(h.submitted)
+        h.coord.on_line(_line("jellyfin-tui", "Paused", ""))
+        h.coord.on_line(_line("jellyfin-tui", "Paused", ""))
+        self.assertEqual(len(h.submitted), before)
+
+
 class DropLogTest(unittest.TestCase):
     """One shared rate limiter across every drop category (§2.4): a garbage
     flood must not become a journal flood, and a noisy category must not starve
