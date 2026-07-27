@@ -1,4 +1,5 @@
 import colorsys
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -414,6 +415,66 @@ class ColorDataBoundsTest(unittest.TestCase):
         p = self.tmp / "-dash.png"
         Image.new("RGB", (64, 64), (224, 16, 80)).save(p, "PNG")
         self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
+
+
+_CORPUS_DIRS = [Path.home() / ".local/share/jellyfin-tui/covers",
+                Path.home() / ".cache/mpris-chroma/covers"]
+
+
+def _corpus() -> list[Path]:
+    return [p for d in _CORPUS_DIRS if d.is_dir()
+            for p in sorted(d.glob("*")) if p.is_file()]
+
+
+@unittest.skipUnless(len(_corpus()) >= 20,
+                     "real cover corpus not present (opt-in)")
+class CorpusTest(unittest.TestCase):
+    """Aggregate behavior over real covers. Unit tests pin properties of a
+    single palette; only the corpus catches a constant that quietly wrecks the
+    distribution — the exact failure that motivated this work."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.covers = _corpus()
+        cls.dark = [extract_colors(p, mode="dark") for p in cls.covers]
+        cls.light = [extract_colors(p, mode="light") for p in cls.covers]
+
+    def test_dark_median_luminance_is_near_the_reference(self):
+        reference = ramp.mean_luminance("#120C14", "#4A2F5C", "#6D8F4F")
+        lums = sorted(ramp.mean_luminance(*c) for c in self.dark)
+        median = lums[len(lums) // 2]
+        self.assertLess(median, reference * 2.0)
+        self.assertGreater(median, reference * 0.3)
+
+    def test_dark_mode_still_distinguishes_bright_from_dark_covers(self):
+        # Compression, not normalization: if p90 collapses onto p10 the palette
+        # has stopped responding to the cover at all.
+        lums = sorted(ramp.mean_luminance(*c) for c in self.dark)
+        self.assertGreater(lums[9 * len(lums) // 10], lums[len(lums) // 10] * 2)
+
+    def test_light_is_brighter_than_dark_for_every_cover(self):
+        for cover, d, l in zip(self.covers, self.dark, self.light):
+            with self.subTest(cover=cover.name):
+                self.assertGreater(ramp.mean_luminance(*l),
+                                   ramp.mean_luminance(*d))
+
+    def test_light_mode_does_not_cluster_at_the_top(self):
+        # The defect the old BANDS["light"] = 0.70-0.97 had: every cover crushed
+        # into one bright band, indistinguishable from each other.
+        lums = sorted(ramp.mean_luminance(*c) for c in self.light)
+        spread = lums[9 * len(lums) // 10] - lums[len(lums) // 10]
+        self.assertGreater(spread, 0.10)
+
+    def test_hues_survive_the_mode_flip(self):
+        for cover, d, l in zip(self.covers, self.dark, self.light):
+            for cd, cl in zip(d, l):
+                with self.subTest(cover=cover.name):
+                    hd = oklab.hex_to_lch(cd)[2]
+                    hl = oklab.hex_to_lch(cl)[2]
+                    if oklab.hex_to_lch(cd)[1] < NEUTRAL_C:
+                        continue   # a neutral has no meaningful hue angle
+                    delta = abs((hd - hl + math.pi) % (2 * math.pi) - math.pi)
+                    self.assertLess(delta, 0.05)
 
 
 if __name__ == "__main__":
