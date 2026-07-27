@@ -8,6 +8,8 @@ daemon never calls this — it exists so the corpus test and the offline lab can
 measure what the shader actually draws.
 """
 
+import math
+
 from .oklab import _to_linear   # one sRGB gamma decode, defined once
 
 # (foreground, background) index pairs and the alphas, mirroring buildPalette.
@@ -16,7 +18,8 @@ _ALPHAS = (1.00, 0.72, 0.50, 0.28)
 
 
 def _channels(value: str) -> tuple[int, int, int]:
-    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+    r, g, b = (int(value[i:i + 2], 16) for i in (1, 3, 5))
+    return r, g, b
 
 
 def expand(c1: str, c2: str, c3: str) -> list[str]:
@@ -28,7 +31,10 @@ def expand(c1: str, c2: str, c3: str) -> list[str]:
             # Blended in 8-bit sRGB, matching palette.zig's blend() exactly —
             # deliberately not gamma-correct, because the point is to reproduce
             # what wlchroma does rather than what it ideally would do.
-            mixed = (round(rgb[bg][k] * (1 - alpha) + rgb[fg][k] * alpha)
+            # math.floor(x + 0.5) rounds half away from zero, matching Zig's @round
+            # behavior. Python's round() uses banker's rounding and would diverge
+            # by ±1/255 on any cell where the sum lands exactly on X.5.
+            mixed = (math.floor(rgb[bg][k] * (1 - alpha) + rgb[fg][k] * alpha + 0.5)
                      for k in range(3))
             cells.append("#%02x%02x%02x" % tuple(mixed))
     return cells

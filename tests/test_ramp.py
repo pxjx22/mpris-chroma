@@ -25,6 +25,16 @@ class ExpandTest(unittest.TestCase):
         self.assertGreater(mid, 100)
         self.assertLess(mid, 155)
 
+    def test_alpha_half_rounds_half_away_from_zero(self):
+        # Zig's @round rounds half away from zero; Python's round() uses banker's
+        # rounding (ties to even). With alpha=0.50, blending can produce exact
+        # X.5 ties that banker's rounds to even, while half-away rounds away.
+        # With c1=#010100 and c2=#000001, the (c1,c2) pair at alpha 0.50 produces
+        # all three channels as 0.5; banker's round(0.5)==0 but we need 1.
+        cells = ramp.expand("#010100", "#000001", "#000000")
+        # cells[2] = (c1,c2) at alpha 0.50 = (1,1,0)*0.5 + (0,0,1)*0.5 = (0.5,0.5,0.5)
+        self.assertEqual(cells[2], "#010101")
+
 
 class LuminanceTest(unittest.TestCase):
     def test_black_and_white_anchor_the_range(self):
