@@ -157,7 +157,7 @@ then D5: `C_i' = min(C_i', ceil_C(L_i', h_i))`.
 | `MIN_DE` | `0.10` | `0.10` | §6 separation threshold |
 | `SEPARATION_STEP` | `0.01` | `0.01` | §6 per-pass L nudge |
 | `MAX_SEPARATION_SHIFT` | `0.04` | `0.04` | §6 per-slot total displacement cap |
-| `MAX_SEPARATION_PASSES` | `8` | `8` | §6 loop safety net |
+| `MAX_SEPARATION_PASSES` | `8` | `8` | §6 iteration cap (a real terminal condition) |
 
 `γ < 1` compresses the top of the range harder than the bottom (slope 0.88 at
 A = 0.8 vs 1.08 at A = 0.2), which is exactly D4. Light mode mirrors this
@@ -215,8 +215,16 @@ that follows from it), never hue:
    bounds — the envelope, the slot's remaining displacement budget (below), and
    **its adjacent slots' current L**, so a slot can never cross a neighbour.
    Recompute chroma at the new L (the ceiling moved) and re-evaluate.
-3. Stop on any of: all pairs clear; no slot can move; every slot has exhausted
-   its displacement budget; or the pass cap is hit.
+3. Stop on any of: all pairs clear; every slot has exhausted its displacement
+   budget; no slot can move because the envelope or a neighbour pins it; or the
+   pass cap is hit.
+
+The reported reason distinguishes all four, because "could not move" has two
+genuinely different causes and collapsing them makes the diagnostic useless.
+Measured: about 3% of in-envelope palettes stop with every slot pinned by a
+*neighbour* while the nearest envelope bound is still 0.2 away. The vocabulary
+is therefore `clear` / `duplicates` / `budget` / `blocked` / `passes`, where
+`blocked` means budget remains but the envelope or a neighbour prevents motion.
 
 The neighbour clamp in step 2 is what makes monotonicity hold **by
 construction** rather than incidentally. Moving a pair apart preserves that
@@ -227,9 +235,14 @@ pair's mutual order, but without the clamp a slot could still be pushed past a
 most `MAX_SEPARATION_SHIFT` in total from its toned L, so a pair's separation can
 grow by at most `2 × MAX_SEPARATION_SHIFT`. At 0.04 that is 0.08 against a dark
 envelope 0.40 wide — 20% of the envelope, not the 0.16 that an uncapped 8-pass
-run would have allowed. The budget binds before the pass cap does
-(0.04 ÷ 0.01 = 4 passes of movement per slot); `MAX_SEPARATION_PASSES` is a loop
-safety net, not the operative limit.
+run would have allowed. The budget is usually the binding limit — a slot taking
+full steps spends 0.04 in 4 passes of the 8 available — but it is **not**
+guaranteed to bind first, and an earlier draft of this spec wrongly claimed it
+was. Clamping against a neighbour or the envelope produces partial steps with no
+lower bound, so a run can exhaust its passes with budget still unspent;
+measured at 135 of 40 000 randomized palettes. `MAX_SEPARATION_PASSES` is
+therefore a real terminal condition, not merely a safety net, which is why
+`passes` is one of the reported reasons.
 
 **Unresolved collisions are reported, not hidden.** When separation terminates
 with a pair still under `MIN_DE`, `colors.py` logs it at DEBUG with the cover
