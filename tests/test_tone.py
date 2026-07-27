@@ -65,11 +65,19 @@ class ToneTest(unittest.TestCase):
                 self.assertLess(out[0], out[1])
                 self.assertLess(out[1], out[2])
 
-    def test_bright_cover_is_compressed_downward_in_dark_mode(self):
-        # The washing defect: a near-white cover must not stay near-white.
+    def test_bright_cover_is_compressed_not_merely_clamped(self):
+        # The washing defect: a near-white cover must be pulled down by the
+        # compression curve, not just flattened against the envelope ceiling.
+        # A clamp-only implementation would pin all three slots at `hi` and
+        # destroy the spread; compression seats the anchor below the ceiling
+        # and keeps the slots apart.
+        lo, hi = ENVELOPES["dark"]
         src = [_lch("#f2f2f2"), _lch("#e8e8e8"), _lch("#fafafa")]
-        for slot in tone.tone(src, "dark"):
-            self.assertLess(slot.L, 0.62)
+        out = tone.tone(src, "dark")
+        pinned = sum(1 for s in out if s.L >= hi - 1e-9)
+        self.assertLess(pinned, 3, "all slots pinned at the ceiling: clamped, not compressed")
+        self.assertGreater(max(s.L for s in out) - min(s.L for s in out), 0.02)
+        self.assertLess(sum(s.L for s in out) / 3, hi - 0.005)
 
     def test_dark_cover_stays_darker_than_a_bright_one(self):
         # Compression, not normalization: cross-cover ordering must survive.

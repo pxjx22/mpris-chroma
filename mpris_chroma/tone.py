@@ -8,7 +8,6 @@ is relative to other covers (compressed), and how its three slots relate to each
 other (preserved).
 """
 
-import math
 from dataclasses import dataclass
 
 from . import oklab
@@ -83,8 +82,8 @@ def tone(source_lch: list[tuple[float, float, float]], mode: str) -> list[Toned]
     gamma = GAMMA[mode]
     anchor = sum(L for L, _, _ in source_lch) / len(source_lch)
     # anchor is a mean of Oklab lightnesses, so it is already in 0..1; the max()
-    # only guards a negative float epsilon at pure black before fractional
-    # exponentiation, which would otherwise be a domain error.
+    # guards negative float epsilon at pure black, which would silently return a
+    # complex when raised to a fractional exponent and fail confusingly at comparison.
     toned_anchor = lo + (hi - lo) * (max(anchor, 0.0) ** gamma)
     out = []
     for L, C, h in source_lch:
