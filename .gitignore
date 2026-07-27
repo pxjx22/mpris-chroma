@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Claude Code worktrees. Local-only checkouts of this same repo — committing
+# them would nest the tree inside itself, and leaving them untracked lets a
+# `git add -A` in one session sweep another session's worktree into its commit.
+.claude/worktrees/
