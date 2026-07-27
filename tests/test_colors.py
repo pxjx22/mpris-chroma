@@ -11,7 +11,7 @@ from mpris_chroma.colors import (
     extract_colors, VIBRANCY_WEIGHT, VIBRANCY_MIN_POP, _vibrancy_score,
 )
 from mpris_chroma import oklab, ramp
-from mpris_chroma.tone import ENVELOPES, NEUTRAL_C, MIN_DE
+from mpris_chroma.tone import ENVELOPES, NEUTRAL_C, MIN_DE, separate, tone
 
 
 def _rgb(hexc: str) -> tuple[int, int, int]:
@@ -222,28 +222,23 @@ class PipelineInvariantTest(unittest.TestCase):
         self.assertLess(ramp.mean_luminance(*extract_colors(img, mode="dark")), 0.25)
 
     def test_every_slot_is_in_gamut(self):
+        # Assert on the pipeline's own pre-quantization slots, not on re-decoded
+        # hex: lch_to_hex clamps into sRGB before quantizing, so a hex round-trip
+        # is in-gamut by construction and would pass even with chroma pushed far
+        # past the ceiling. The second clause pins that the hex we emit really
+        # does represent the slot we computed.
         img = self.tmp / "g.png"
         _thirds(img, "#ffee00", "#00e5ff", "#1010e0")   # low-ceiling hues
-        # This yellow's chroma is pinned to the exact max_chroma boundary at
-        # light mode's L~0.92 (chroma_for has zero margin once the source
-        # exceeds the ceiling). Verified directly on the pipeline's own Toned
-        # slot (pre-hex), that point IS in_gamut. But this test checks the
-        # public contract -- the returned *hex string* -- and re-deriving Lab
-        # from an 8-bit hex re-parse reintroduces floating-point noise (worst
-        # measured: -1.30e-7 on the linear channel nearest zero, for #ffff00 at
-        # this L) that straddles oklab.in_gamut's 1e-7 epsilon. That epsilon is
-        # tuned for max_chroma's bisection, not for hex round-trips, so a
-        # genuinely valid boundary color can read back as a hair "outside".
-        # GAMUT_EPS (1e-6, ~130x that noise) absorbs it while still catching
-        # a real violation: chroma pushed 0.01 over the ceiling -- the margin
-        # tone.py's own boundary test uses -- fails even with this tolerance.
-        GAMUT_EPS = 1e-6
         for mode in ("dark", "light"):
-            for c in extract_colors(img, mode=mode):
-                with self.subTest(mode=mode, color=c):
-                    L, C, h = oklab.hex_to_lch(c)
-                    self.assertTrue(
-                        oklab.in_gamut(*oklab.from_lch(L, max(C - GAMUT_EPS, 0.0), h)))
+            picked, n = colors._select(colors._histogram(img))
+            slots, _ = separate(tone(picked, mode), mode, n)
+            for s in slots:
+                with self.subTest(mode=mode, slot=s.to_hex()):
+                    self.assertTrue(oklab.in_gamut(*s.to_lab()))
+                    self.assertLess(
+                        oklab.delta_e(s.to_lab(),
+                                      oklab.from_lch(*oklab.hex_to_lch(s.to_hex()))),
+                        0.005)
 
 
 DEFAULT_ACCENT = "#a48ec7"  # the pathological/rejected fallback triple

@@ -22,7 +22,10 @@ VIBRANCY_MIN_POP = 0.01  # coverage below this gets no vibrancy boost, so a
 # reject three shades of one color before toning, or stage 4 is handed a
 # collision it cannot solve. Measured on source colors, so it is
 # mode-independent — mode must only re-tone the same three picks, never change
-# which ones they are. Below tone.MIN_DE because toning compresses distances.
+# which ones they are. Lower than tone.MIN_DE on purpose: separation is the
+# designated repair for collisions that toning creates or worsens, so
+# selection only has to reject picks that are already near-identical at the
+# source — it does not need to anticipate what toning will do to them.
 SELECT_MIN_DE = 0.08
 
 # Album artwork is only ever a raster photo; SVG/PDF/HTML and other formats are
@@ -112,7 +115,14 @@ def _select(hist: list[tuple[int, tuple[float, float, float]]]
     Deliberately takes no `mode`: mode may only re-tone the same three picks,
     never change which ones they are, and the cheapest way to guarantee that is
     to make it impossible to express.
+
+    An empty `hist` returns `([], 0)` rather than raising: `extract_colors`
+    already guards this case before calling in, but the docstring above
+    advertises other callers (a test, an offline lab), and padding
+    `picked[-1]` below has nothing to repeat once `hist` is empty.
     """
+    if not hist:
+        return [], 0
     total = sum(count for count, _ in hist)
     # Most apparent first, vibrancy-aware: coverage plus a chroma bonus, so a
     # small vivid accent (a logo, a face) can beat a large drab background.
@@ -159,4 +169,5 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
         # An unseparable palette is an accepted outcome, but never a silent one.
         _log.debug("palette for %s left a pair at dE %.3f (%s)",
                    image_path.name, result.residual_de, result.reason)
-    return tuple(slot.to_hex() for slot in slots)
+    c1, c2, c3 = (slot.to_hex() for slot in slots)
+    return c1, c2, c3
