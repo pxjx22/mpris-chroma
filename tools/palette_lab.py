@@ -435,14 +435,19 @@ def main() -> int:
                 # travelling so this can't get stuck bouncing at one index;
                 # running off either end exits the while loop normally.
                 # Moving left clamps at 0 rather than going negative — the
-                # At the low edge the skip must BOUNCE, not stand still: a
+                # At the low edge the skip must bounce AND stay bounced. A
                 # plain max(0, i-1) leaves i unchanged, so a corrupt cover at
-                # index 0 re-renders forever. Raw mode is held across this
-                # loop, so a spin here never reaches _read_key and Ctrl-C
-                # arrives as an unconsumed byte with ISIG off — the only way
-                # out would be a kill from another shell.
+                # index 0 re-renders forever; bouncing without flipping
+                # `direction` ping-pongs 0<->1 forever when both are corrupt.
+                # Flipping means the scan continues forward past the whole run.
+                # This matters more than it looks: raw mode is held across this
+                # loop, so a spin never reaches _read_key, and Ctrl-C arrives
+                # as an unconsumed byte with ISIG off — the only way out would
+                # be a kill from another shell.
                 skipped_corrupt += 1
-                i = i - 1 if (direction < 0 and i > 0) else i + 1
+                if direction < 0 and i == 0:
+                    direction = 1
+                i += direction
                 continue
             _stop_viewer(viewer)
             viewer = subprocess.Popen(["imv", str(path)],
