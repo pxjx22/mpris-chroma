@@ -177,6 +177,7 @@ expressible. Transforms are Bjorn Ottosson's; no dependencies beyond `math`.
 Hue is in radians throughout. sRGB channels are 0-1, not 0-255.
 """
 
+import functools
 import math
 
 # The forward transform's cube roots are taken of non-negative linear-light
@@ -242,6 +243,12 @@ _C_BRACKET = 0.5
 _BISECTIONS = 24
 
 
+# Memoized because `Toned.C` derives chroma from the *current* lightness on every
+# access — the design that stops a stored chroma going stale when separation
+# moves L — which makes this the hottest function in the pipeline. Within one
+# palette the same (L, h) recurs constantly, so the hit rate is high. The cache
+# is keyed on floats and is unbounded in principle, hence maxsize.
+@functools.lru_cache(maxsize=4096)
 def max_chroma(L: float, h: float) -> float:
     """Greatest chroma that is still in sRGB at this lightness and hue.
 
@@ -901,6 +908,8 @@ daemon never calls this — it exists so the corpus test and the offline lab can
 measure what the shader actually draws.
 """
 
+from .oklab import _to_linear   # one sRGB gamma decode, defined once
+
 # (foreground, background) index pairs and the alphas, mirroring buildPalette.
 _PAIRS = ((0, 1), (1, 2), (2, 0))
 _ALPHAS = (1.00, 0.72, 0.50, 0.28)
@@ -908,10 +917,6 @@ _ALPHAS = (1.00, 0.72, 0.50, 0.28)
 
 def _channels(value: str) -> tuple[int, int, int]:
     return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
-
-
-def _to_linear(c: float) -> float:
-    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
 def expand(c1: str, c2: str, c3: str) -> list[str]:
