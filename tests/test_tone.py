@@ -268,7 +268,11 @@ class SeparationTest(unittest.TestCase):
             self.assertLessEqual(abs(a.L - b.L), tone.MAX_SEPARATION_SHIFT + 1e-9)
 
     def test_separation_terminates_in_light_mode_too(self):
-        after, result = tone.separate(self._collide("light"), "light", 3)
+        before = self._collide("light")
+        after, result = tone.separate(before, "light", 3)
+        # Light mode's only separation coverage, so prove it actually ran:
+        # without this the assertions below hold for a do-nothing separate().
+        self.assertNotEqual([s.L for s in before], [s.L for s in after])
         lo, hi = ENVELOPES["light"]
         for slot in after:
             self.assertGreaterEqual(slot.L, lo - 1e-9)

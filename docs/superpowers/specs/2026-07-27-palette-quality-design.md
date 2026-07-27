@@ -221,8 +221,11 @@ that follows from it), never hue:
 
 The reported reason distinguishes all four, because "could not move" has two
 genuinely different causes and collapsing them makes the diagnostic useless.
-Measured: about 3% of in-envelope palettes stop with every slot pinned by a
-*neighbour* while the nearest envelope bound is still 0.2 away. The vocabulary
+Measured over 40 000 randomized in-envelope palettes: 12.1% stop with every
+slot pinned by a *neighbour* while the nearest envelope bound is still 0.1
+away, and 25.1% with it 0.05 away. (An earlier draft said "3% at 0.2", which
+is not measurable — the dark envelope is only 0.40 wide, so 0.2 from the
+nearest bound is reachable only at the exact midpoint.) The vocabulary
 is therefore `clear` / `duplicates` / `budget` / `blocked` / `passes`, where
 `blocked` means budget remains but the envelope or a neighbour prevents motion.
 
