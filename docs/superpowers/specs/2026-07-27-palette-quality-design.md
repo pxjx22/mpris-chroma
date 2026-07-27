@@ -153,7 +153,8 @@ then D5: `C_i' = min(C_i', ceil_C(L_i', h_i))`.
 | `NEUTRAL_C` | `0.02` | `0.02` | below this, stay neutral |
 | `MIN_DE` | `0.10` | `0.10` | §6 separation threshold |
 | `SEPARATION_STEP` | `0.01` | `0.01` | §6 per-pass L nudge |
-| `MAX_SEPARATION_PASSES` | `8` | `8` | §6 termination bound |
+| `MAX_SEPARATION_SHIFT` | `0.04` | `0.04` | §6 per-slot total displacement cap |
+| `MAX_SEPARATION_PASSES` | `8` | `8` | §6 loop safety net |
 
 `γ < 1` compresses the top of the range harder than the bottom (slope 0.88 at
 A = 0.8 vs 1.08 at A = 0.2), which is exactly D4. Light mode mirrors this
@@ -161,6 +162,14 @@ A = 0.8 vs 1.08 at A = 0.2), which is exactly D4. Light mode mirrors this
 dark covers while bright ones keep their relative position, against an envelope
 shifted up. The two envelopes are tuned independently in the lab and are not
 required to be exact reflections of each other.
+
+**The dark and light numbers do not have equal standing.** Dark mode's envelope
+is fitted against a measured reference — `witch_hour`, the palette the user
+actually configured — and validated against the corpus in §5. Light mode has no
+such anchor: `(0.55, 0.92)` and `γ = 1.18` are a **provisional lab seed**,
+reasoned from symmetry rather than fitted to anything. §12 gives light mode its
+own acceptance criteria for that reason; it must not be read as carrying dark
+mode's evidence.
 
 ### Measured result
 
@@ -194,15 +203,37 @@ appears — but it must not re-select, or it breaks mode-independence (§7).
 **Algorithm.** Selection is fixed; separation adjusts only L (and the chroma
 that follows from it), never hue:
 
-1. Order slots by `L'`, tie-broken by original index (deterministic).
-2. While some pair has `dE < MIN_DE` and `iterations < MAX_SEPARATION_PASSES`:
-   take the closest pair, move the lighter slot up by `SEPARATION_STEP` and the
-   darker down by the same, each clamped to the envelope; recompute chroma at the
-   new L (the ceiling moved) and re-evaluate.
-3. Stop when all pairs clear, or no slot can move — the envelope is exhausted.
+1. Fix a **rank order** once, from the toned `L'`, tie-broken by original index.
+   This order is an invariant for the rest of the algorithm; slot identity is
+   carried alongside so the output can be restored to selection order.
+2. While some pair has `dE < MIN_DE` and `passes < MAX_SEPARATION_PASSES`:
+   take the closest pair, move the higher-ranked slot up by `SEPARATION_STEP` and
+   the lower-ranked one down by the same. Each move is clamped by **three**
+   bounds — the envelope, the slot's remaining displacement budget (below), and
+   **its adjacent slots' current L**, so a slot can never cross a neighbour.
+   Recompute chroma at the new L (the ceiling moved) and re-evaluate.
+3. Stop on any of: all pairs clear; no slot can move; every slot has exhausted
+   its displacement budget; or the pass cap is hit.
 
-Pushing apart in the direction of existing order means ordering is preserved, so
-the monotonicity property in §8 still holds after separation.
+The neighbour clamp in step 2 is what makes monotonicity hold **by
+construction** rather than incidentally. Moving a pair apart preserves that
+pair's mutual order, but without the clamp a slot could still be pushed past a
+*third* slot and invert the source ordering that §8 asserts.
+
+**Displacement budget — the bound on the D1 exception.** Each slot may move at
+most `MAX_SEPARATION_SHIFT` in total from its toned L, so a pair's separation can
+grow by at most `2 × MAX_SEPARATION_SHIFT`. At 0.04 that is 0.08 against a dark
+envelope 0.40 wide — 20% of the envelope, not the 0.16 that an uncapped 8-pass
+run would have allowed. The budget binds before the pass cap does
+(0.04 ÷ 0.01 = 4 passes of movement per slot); `MAX_SEPARATION_PASSES` is a loop
+safety net, not the operative limit.
+
+**Unresolved collisions are reported, not hidden.** When separation terminates
+with a pair still under `MIN_DE`, `colors.py` logs it at DEBUG with the cover
+name and the residual dE, and the lab surfaces it in the walker line. A palette
+that cannot be separated within budget is an accepted outcome — for a genuinely
+monochrome cover it is the *correct* outcome — but it must be observable, in
+keeping with the SEC-019 precedent that a degraded palette is never silent.
 
 **Carve-out — duplicate slots stay duplicated.** When a cover yields fewer than
 three distinct colors, `extract_colors` repeats the last real one rather than
@@ -257,11 +288,14 @@ explicitly so the diff is not a surprise:
   `test_dark_colored_cover_is_lifted_to_readable` (S_MIN/V_MIN → chroma fraction
   and envelope), `test_grayscale_cover_stays_neutral` (S_MIN → `NEUTRAL_C`),
   `test_light_mode_same_hues_brighter_values` (`BANDS` → `ENVELOPES`).
-- **Frozen, must pass byte-identical** — `VibrancyScoreTest`,
-  `FormatAllowlistTest`, `DecodeBoundsTest`, `ColorDataBoundsTest`, and the
-  remaining six `ExtractTest` cases, notably
-  `test_mode_switch_never_changes_which_colors_are_picked` and
-  `test_solid_cover_repeats_not_invents`.
+- **Frozen — the test methods themselves must not be edited**, and must still
+  pass as written: `VibrancyScoreTest`, `FormatAllowlistTest`,
+  `DecodeBoundsTest`, `ColorDataBoundsTest`, and the remaining six `ExtractTest`
+  cases, notably `test_mode_switch_never_changes_which_colors_are_picked` and
+  `test_solid_cover_repeats_not_invents`. This constrains the *source of the
+  tests*, not the palettes they exercise — toning changes almost every extracted
+  hex, which is the point of the work; these tests are frozen precisely because
+  they assert properties that survive it.
 
 **New properties**
 
@@ -273,10 +307,15 @@ explicitly so the diff is not a surprise:
   today, and still tones brighter than a dark synthetic cover.
 - **Within-cover fidelity:** a contrasty synthetic cover retains a substantial
   fraction of its source spread; a flat one stays flat.
-- **Distinctness:** every pair clears `MIN_DE`, *or* the envelope is provably
-  exhausted, *or* the slots are duplicates of one source color.
-- **Light mode is the mirror:** the same properties hold with the inverted
-  envelope, and hues match dark mode's for the same cover.
+- **Distinctness:** every pair clears `MIN_DE`, *or* one of §6's accepted
+  terminal conditions holds — envelope exhausted, displacement budget spent, pass
+  cap reached, or the slots are duplicates of one source color. A test asserts
+  each terminal condition is reachable and correctly reported.
+- **Separation is bounded:** no slot moves more than `MAX_SEPARATION_SHIFT` from
+  its toned L, and no slot crosses a neighbour (the §6 rank order is preserved
+  end to end).
+- **Light-mode symmetry:** the same properties hold against the light envelope,
+  and hues match dark mode's for the same cover.
 - `NEUTRAL_C` exemption: a near-neutral input is not chroma-lifted.
 
 **Corpus test — opt-in, not in the default run.** One test running the full
@@ -354,10 +393,25 @@ only (raw-mode key reads via `termios`, no curses).
 
 ## 12. Acceptance
 
-**Measurable (this spec's tests):** all of §7 and §8 pass; the frozen classes
-listed in §8 still pass byte-identical; the suite grows from its 224 baseline
-after the §8 replacements are accounted for; median ramp luminance in dark mode
-lands near the `witch_hour` reference (0.075) with p10→p90 still spanning >2×.
+**Measurable, dark mode:** all of §7 and §8 pass; the frozen tests listed in §8
+still pass with their source unedited; the suite grows from its 224 baseline
+after the §8 replacements are accounted for; median ramp luminance lands near the
+`witch_hour` reference (0.075) with p10→p90 still spanning >2×.
 
-**Visual: the user's call**, via the §9 walker. Constants are then tuned from the
-recorded verdicts and re-checked cold against the holdout.
+**Measurable, light mode.** There is no reference palette to fit against, so
+light mode is accepted on *relational* criteria instead of a target number:
+
+- **Strictly brighter than dark:** for every corpus cover, light-mode ramp
+  luminance exceeds the same cover's dark-mode luminance.
+- **Hue and order preserved across the flip:** same hues within tolerance, and
+  the same slot rank order, for the same cover in both modes.
+- **No upper-envelope clustering:** the p10→p90 spread of light-mode ramp
+  luminance across the corpus stays above a floor, so light mode does not
+  reproduce today's defect of crushing every cover into a narrow bright band
+  (the current `BANDS["light"]` = 0.70–0.97 failure).
+- **Within-cover spread survives** at a comparable fraction to dark mode's 92%.
+
+**Visual: the user's call**, via the §9 walker, for both modes — and the light
+seed in §5 should be expected to move as a result, where the dark constants are
+expected to hold. Constants are then tuned from the recorded verdicts and
+re-checked cold against the holdout.
