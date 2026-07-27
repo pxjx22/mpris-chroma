@@ -419,7 +419,10 @@ class ColorDataBoundsTest(unittest.TestCase):
 
 # Below this chroma, the hue angle is dominated by 8-bit output quantization
 # rather than by anything the pipeline did: quantization perturbs Oklab
-# (a, b) by roughly 0.002, which produces an angular error of about
+# (a, b) by roughly 0.002 — measured by perturbing random sRGB triples one
+# least-significant bit and converting through oklab.hex_to_lch: median 0.00127,
+# p90 0.00169, so 0.002 is deliberately the conservative end — which produces
+# an angular error of about
 # atan(0.002 / C). For that error to stay inside this test's own 0.05 rad
 # hue tolerance, chroma must exceed quantization_noise / tan(tolerance) =
 # 0.002 / tan(0.05) ~= 0.0400. Below that, atan2 amplifies a fixed cartesian
