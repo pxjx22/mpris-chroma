@@ -10,6 +10,7 @@ from .apply import CtlError, apply_wlchroma, revert_wlchroma
 from .colors import extract_colors
 from .coordinator import Coordinator, mode_from_color_scheme
 from .cover import resolve_cover
+from .framing import READ_CHUNK, LineFramer
 from .worker import Mailbox, Worker
 
 _log = logging.getLogger("mpris_chroma.sync")
@@ -72,6 +73,37 @@ def _follow_cmd():
         "playerctl", f"--player={PLAYERS}", "-a", "--follow", "metadata",
         "--format", "{{playerName}}\t{{status}}\t{{mpris:artUrl}}",
     ]
+
+
+def _make_io_reader(fd, framer, on_line, *, on_hangup, hup_err_mask):
+    """Build the GLib IO callback for playerctl's stdout (SEC-011 §3).
+
+    Module-level (and GLib-free — the caller supplies the condition mask) so the
+    flood test can drive the real reader instead of a copy of it.
+
+    Exactly ONE bounded read per dispatch: a read-until-EAGAIN loop would
+    reintroduce the unbounded drain the framer exists to prevent. GLib
+    re-dispatches this source while data remains, so a flood costs at most one
+    chunk per loop iteration and every equal-priority source (retry timers,
+    D-Bus) gets its turn in between — bounded latency, not merely eventual
+    progress. EOF is treated exactly like HUP: playerctl is gone, so hang up.
+    """
+    def _on_io(_fd, condition):
+        if condition & hup_err_mask:
+            on_hangup()
+            return False
+        try:
+            data = os.read(fd, READ_CHUNK)
+        except BlockingIOError:
+            return True          # spurious wakeup; nothing readable yet
+        if not data:
+            on_hangup()          # EOF: same contract as HUP
+            return False
+        for line in framer.feed(data):
+            on_line(line)
+        return True
+
+    return _on_io
 
 
 def _submit_guarded(item, worker, mailbox, on_worker_dead) -> None:
@@ -192,30 +224,29 @@ def main():
     worker.start()
 
     # Enter the guaranteed-cleanup scope immediately after a successful spawn: an
-    # exception while wiring the IO channel or receivers below would otherwise
-    # leak the playerctl child. `channel` starts None so the finally can tell
-    # whether it was created (SEC-013).
+    # exception while wiring the IO watch or receivers below would otherwise leak
+    # the playerctl child (SEC-013).
     proc = _spawn_follow()
-    channel = None
+    stdout = proc.stdout        # never None: _spawn_follow always pipes stdout
     try:
-        channel = GLib.IOChannel.unix_new(proc.stdout.fileno())
-        channel.set_flags(GLib.IOFlags.NONBLOCK)
+        fd = stdout.fileno()
+        os.set_blocking(fd, False)
+        framer = LineFramer(on_drop=lambda detail:
+                            coordinator.log_drop("oversize", detail))
 
-        def _on_io(chan, condition):
+        def _on_hangup():
+            # playerctl died unexpectedly (HUP/ERR or EOF); exit non-zero so
+            # systemd's Restart=on-failure recovers us.
             nonlocal exit_code
-            if condition & (GLib.IOCondition.HUP | GLib.IOCondition.ERR):
-                exit_code = 1  # playerctl died unexpectedly; let systemd restart us
-                loop.quit()
-                return False
-            while True:
-                status, line, _length, _term = chan.read_line()
-                if status != GLib.IOStatus.NORMAL or not line:
-                    break  # AGAIN (drained) or EOF
-                coordinator.on_line(line)
-            return True
+            exit_code = 1
+            loop.quit()
 
-        GLib.io_add_watch(
-            channel, GLib.PRIORITY_DEFAULT,
+        _on_io = _make_io_reader(
+            fd, framer, coordinator.on_line, on_hangup=_on_hangup,
+            hup_err_mask=GLib.IOCondition.HUP | GLib.IOCondition.ERR)
+
+        GLibUnix.fd_add_full(
+            GLib.PRIORITY_DEFAULT, fd,
             GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR,
             _on_io)
 
@@ -264,11 +295,7 @@ def main():
         stopping.set()
         worker.stop_and_join(WORKER_STOP_TIMEOUT)
         _terminate_child(proc)
-        if channel is not None:
-            try:
-                channel.shutdown(False)
-            except GLib.Error:
-                pass
+        stdout.close()   # release the pipe read end (was channel.shutdown)
     sys.exit(exit_code)
 
 
