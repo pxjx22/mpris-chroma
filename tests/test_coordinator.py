@@ -494,10 +494,13 @@ class LineValidationTest(unittest.TestCase):
         self.assertEqual(h.coord.players, {})
 
     def test_instance_suffixed_name_is_accepted(self):
-        # Verified against playerctl on the session bus: --player=spotify
-        # matches org.mpris.MediaPlayer2.spotify.instance42, and playerctl
-        # renders the FULL dotted name as {{playerName}}. Accepting the suffixed
-        # form is therefore necessary, not merely tolerant.
+        # Measured on the session bus: --player=spotify DOES match
+        # org.mpris.MediaPlayer2.spotify.instance42, but {{playerName}} renders
+        # the base name, so an instanced player arrives here as plain `spotify`
+        # (covered by the other accept tests). This pins the suffix branch as
+        # deliberate tolerance for playerctl variants that pass the dotted name
+        # through — it must not regress into a bare-prefix match, which is what
+        # test_lookalike_prefixed_name_is_rejected guards.
         h = _Harness()
         h.coord.on_line(_line("spotify.instance42", "Playing", "https://x/a"))
         self.assertEqual(len(h.submitted), 1)

@@ -281,10 +281,16 @@ class Coordinator:
         Mirrors playerctl's own `--player=` matching, which ignores the MPRIS
         `.instanceN` suffix: a name is allowed iff it equals a configured base
         or starts with base + "." — never a bare prefix, or `spotifyevil` would
-        ride in on `spotify`. Verified against playerctl on the session bus:
-        it matched an instance-suffixed name, rejected the lookalike, and
-        rendered the full dotted name as {{playerName}} — so accepting the
-        suffixed form is required, not merely tolerant.
+        ride in on `spotify`.
+
+        Measured against playerctl on the session bus: owning
+        `org.mpris.MediaPlayer2.spotify.instance42`, `--player=spotify` matched
+        it and rejected the lookalike `spotifyevil` — but {{playerName}} renders
+        the BASE name, so an instanced player reaches us as plain `spotify` and
+        the equality branch is the live path. The suffix branch is deliberate
+        tolerance for playerctl variants that pass the dotted name through, not
+        a requirement of the observed behavior. (`playerctl -l` does list the
+        full dotted identifier; that listing is not what --format renders.)
         """
         return any(name == base or name.startswith(base + ".")
                    for base in self._allowed_bases)
