@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 
+# User-generated A/B verdict data from tools/palette_lab.py, not source.
+tools/verdicts.json
+
 # Claude Code worktrees. Local-only checkouts of this same repo — committing
 # them would nest the tree inside itself, and leaving them untracked lets a
 # `git add -A` in one session sweep another session's worktree into its commit.

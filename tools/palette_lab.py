@@ -12,10 +12,15 @@ prefers per cover. No daemon, no D-Bus, no threads — cover in, palette out.
 
 import argparse
 import colorsys
+import enum
 import hashlib
 import json
+import os
+import select
+import signal
 import subprocess
 import sys
+import tempfile
 import termios
 import tty
 from dataclasses import dataclass
@@ -36,6 +41,15 @@ VERDICTS = Path(__file__).resolve().parent / "verdicts.json"
 # decode (SEC-005) — every slot identical, so it can never arise from a real
 # extraction (selection always rejects near-duplicate picks at SELECT_MIN_DE).
 _FALLBACK = ("#a48ec7",) * 3
+
+
+class RenderOutcome(enum.Enum):
+    """Sentinel for render()'s second return slot when a cover can't be read.
+
+    A bare "corrupt" string literal typo-mismatches silently (`== "corupt"`
+    is just False, not an error); an enum member fails loudly instead.
+    """
+    CORRUPT = "corrupt"
 
 
 # --- Historical reproduction, lab-only -------------------------------------
@@ -100,7 +114,12 @@ def _legacy_extract(hist: list[tuple[int, tuple[float, float, float]]],
             picked.append(hsv)
     while len(picked) < 3:
         picked.append(picked[-1])
-    return tuple(_legacy_hex_of(*_legacy_clamp_hsv(*p, mode=mode)) for p in picked)
+    # Destructure rather than `tuple(generator)`: a generator satisfies
+    # `list`/`tuple` structurally but not the declared 3-tuple arity, the same
+    # defect already fixed in oklab.oklab_to_srgb, ramp._channels, and
+    # colors.extract_colors.
+    c1, c2, c3 = (_legacy_hex_of(*_legacy_clamp_hsv(*p, mode=mode)) for p in picked)
+    return c1, c2, c3
 # --- end historical reproduction -------------------------------------------
 
 
@@ -154,7 +173,8 @@ def _assist(slots, amount: float, hi: float):
     return lifted
 
 
-def render(path: Path, cand: Candidate, mode: str):
+def render(path: Path, cand: Candidate, mode: str
+           ) -> tuple[tuple[str, str, str], "tone_mod.SeparationResult | None | RenderOutcome"]:
     """Palette for this cover under this candidate, plus its separation result.
 
     The histogram is checked once, up front, for both branches: 7 covers in
@@ -162,13 +182,13 @@ def render(path: Path, cand: Candidate, mode: str):
     extension) that the pipeline correctly refuses by signature and maps to
     the fallback triple. That triple is indistinguishable from a real
     lavender-ish extraction unless the caller knows *why* it was returned, so
-    this reports "corrupt" as the second element instead of a SeparationResult
-    — the walker can then label it instead of presenting a stock swatch as if
-    it were this cover's actual palette.
+    this reports RenderOutcome.CORRUPT as the second element instead of a
+    SeparationResult — the walker can then label it instead of presenting a
+    stock swatch as if it were this cover's actual palette.
     """
     hist = _histogram(path)
     if not hist:
-        return _FALLBACK, "corrupt"
+        return _FALLBACK, RenderOutcome.CORRUPT
     if cand.legacy:
         return _legacy_extract(hist, mode), None
     picked, n = _select(hist)
@@ -208,7 +228,16 @@ def _read_key() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == "\x1b":                      # arrow keys arrive as an escape seq
-            ch += sys.stdin.read(2)
+            # A lone ESC is indistinguishable from the first byte of an arrow
+            # sequence until the rest either shows up or doesn't. Raw mode
+            # disables ISIG, so an unconditional read(2) here would block
+            # forever on a bare ESC with no Ctrl-C left to escape it — the
+            # user would be locked out with only two more keypresses as an
+            # exit. An arrow sequence's remaining bytes arrive together,
+            # well inside this window; a bare ESC never sends more, so a
+            # timeout here means "just ESC."
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch += sys.stdin.read(2)
         return ch
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
@@ -220,7 +249,7 @@ def _describe(colors_tuple, result) -> str:
         " ".join(colors_tuple),
         " ".join(".%02d" % round(l[0] * 100) for l in lch),
         ramp.mean_luminance(*colors_tuple))
-    if result == "corrupt":
+    if result is RenderOutcome.CORRUPT:
         line += "   [unreadable cover -> fallback palette, not a real extraction]"
     elif result is not None and not result.resolved and result.reason != "duplicates":
         line += "   collision dE %.3f (%s)" % (result.residual_de, result.reason)
@@ -244,7 +273,56 @@ def _stop_viewer(viewer) -> None:
         viewer.wait()
 
 
+def _load_verdicts() -> dict:
+    """Load recorded verdicts, tolerating a missing or corrupt file.
+
+    These judgements can only come from a human sitting through the walker
+    again; a truncated write or a stray byte must never make the whole
+    session start over silently, so this warns on stderr and starts empty
+    rather than propagating JSONDecodeError out of main().
+    """
+    if not VERDICTS.exists():
+        return {}
+    try:
+        return json.loads(VERDICTS.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print("warning: %s is unreadable (%s); starting from no verdicts"
+              % (VERDICTS, e), file=sys.stderr)
+        return {}
+
+
+def _save_verdicts(verdicts: dict) -> None:
+    """Write verdicts atomically: temp file in the same directory, then
+    os.replace() into position. os.replace is atomic on POSIX, so a process
+    killed mid-write leaves either the old file or the new one, never a
+    half-written truncation of the user's accumulated judgements — the
+    entire point of the tool, and not something a re-run can regenerate.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(VERDICTS.parent),
+                                     prefix=".verdicts-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(verdicts, indent=1, sort_keys=True))
+        os.replace(tmp_name, VERDICTS)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def main() -> int:
+    # SIGTERM (killed from another shell) and SIGHUP (the terminal window
+    # closing) otherwise tear the interpreter down mid-syscall if delivery
+    # lands while blocked in _read_key()'s raw-mode read — landing both of
+    # this tool's worst outcomes at once: the desktop stuck on a candidate
+    # palette AND the terminal left in raw mode, the latter with no
+    # signal-driven way to undo it. Raising SystemExit instead unwinds
+    # normally, so the existing `finally` (viewer teardown + revert) and
+    # _read_key's own termios restore both still run.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(1))
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--a", default="legacy", choices=sorted(CANDIDATES))
     ap.add_argument("--b", default="oklab-v1", choices=sorted(CANDIDATES))
@@ -263,27 +341,63 @@ def main() -> int:
                      if c.legacy else ""))
         return 0
 
-    verdicts = json.loads(VERDICTS.read_text()) if VERDICTS.exists() else {}
+    verdicts = _load_verdicts()
     if args.replay:
-        tally = {}
+        # Keys now encode (cover, a, b, mode) (IMPORTANT 4), so one flat tally
+        # across every pairing and mode is no longer meaningful — a "12 A / 9
+        # B" total could be legacy-vs-oklab-v1 in dark mixed with an unrelated
+        # oklab-vivid-vs-oklab-darker in light. Group by (a, b, mode) instead.
+        groups: dict[tuple[str, str, str], dict[str, int]] = {}
         for key, v in verdicts.items():
+            parts = key.split("|")
+            if len(parts) == 4:
+                _, a_name, b_name, mode = parts
+            elif len(parts) == 3:
+                # Verdict recorded before IMPORTANT 4's fix — mode unknown.
+                _, a_name, b_name = parts
+                mode = "?"
+            else:
+                continue
+            tally = groups.setdefault((a_name, b_name, mode), {})
             tally[v] = tally.get(v, 0) + 1
-        print("recorded verdicts: %s (%d covers)"
-              % (tally, len(verdicts)))
+        if not groups:
+            print("no verdicts recorded yet")
+            return 0
+        for (a_name, b_name, mode), tally in sorted(groups.items()):
+            print("%-14s vs %-16s [%-5s] %s (%d covers)"
+                  % (a_name, b_name, mode, tally, sum(tally.values())))
         return 0
 
     a, b = CANDIDATES[args.a], CANDIDATES[args.b]
-    files = corpus(args.holdout)
-    if not files:
+    raw = corpus(0)
+    if not raw:
         print("no covers found in %s" % ", ".join(str(d) for d in CORPUS_DIRS))
         return 1
+    files = corpus(args.holdout)
+    if not files:
+        # Distinct from "no corpus at all" (MINOR 9): the covers exist, the
+        # holdout slice just ate all of them.
+        print("holdout (%d) consumed the entire corpus (%d covers) — "
+              "pass a smaller --holdout" % (args.holdout, len(raw)))
+        return 1
 
-    i, showing_b, viewer = 0, True, None
+    i, showing_b, viewer, direction = 0, True, None, 1
+    skipped_corrupt = 0
     try:
         while 0 <= i < len(files):
             path = files[i]
             pa, ra = render(path, a, args.mode)
             pb, rb = render(path, b, args.mode)
+            if ra is RenderOutcome.CORRUPT and rb is RenderOutcome.CORRUPT:
+                # MINOR 7: both candidates fall back to the identical stock
+                # triple for an undecodable cover — never push that to the
+                # desktop or solicit a verdict that would mean nothing.
+                # Advance in whatever direction the walker was already
+                # travelling so this can't get stuck bouncing at one index;
+                # running off either end exits the while loop normally.
+                skipped_corrupt += 1
+                i += direction
+                continue
             _stop_viewer(viewer)
             viewer = subprocess.Popen(["imv", str(path)],
                                       stdout=subprocess.DEVNULL,
@@ -294,7 +408,10 @@ def main() -> int:
             except CtlError as e:
                 print("\nwlchroma-ctl failed: %s" % e)
                 return 1
-            key = "%s|%s|%s" % (path.name, a.name, b.name)
+            # Mode is part of the key (IMPORTANT 4): the same cover/pairing
+            # judged under --mode light must not silently overwrite the
+            # --mode dark verdict for it.
+            key = "%s|%s|%s|%s" % (path.name, a.name, b.name, args.mode)
             counts = {}
             for v in verdicts.values():
                 counts[v] = counts.get(v, 0) + 1
@@ -316,22 +433,36 @@ def main() -> int:
                 showing_b = not showing_b
             elif ch in ("a", "b", "="):
                 verdicts[key] = ch
-                VERDICTS.write_text(json.dumps(verdicts, indent=1, sort_keys=True))
+                _save_verdicts(verdicts)
                 i += 1
+                direction = 1
             elif ch == "\x1b[C":
                 i += 1
+                direction = 1
             elif ch == "\x1b[D":
                 i = max(0, i - 1)
+                direction = -1
             elif ch in ("q", "\x03"):
                 break
     finally:
         # Never leave an orphaned viewer or the desktop stuck on a candidate.
-        _stop_viewer(viewer)
+        # Nested, not sequential (CRITICAL 1): a second Ctrl-C landing inside
+        # _stop_viewer's wait() — bounded, or unbounded after kill() — raises
+        # KeyboardInterrupt right there. If revert_wlchroma() ran after it in
+        # the same block, that interrupt would skip the revert and strand the
+        # desktop on a candidate palette. Nesting means a failure in either
+        # step cannot suppress the other.
         try:
-            revert_wlchroma()
-        except CtlError:
-            pass
+            _stop_viewer(viewer)
+        finally:
+            try:
+                revert_wlchroma()
+            except CtlError:
+                pass
     print("\nverdicts saved to %s" % VERDICTS)
+    if skipped_corrupt:
+        print("(%d corrupt cover(s) skipped — no verdict recorded)"
+              % skipped_corrupt)
     return 0
 
 
