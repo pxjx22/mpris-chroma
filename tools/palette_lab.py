@@ -223,25 +223,41 @@ def corpus(holdout: int) -> list[Path]:
 
 
 def _read_key() -> str:
+    """Read one keypress, decoding a 3-byte arrow-key escape sequence.
+
+    Raw mode is entered once in main() and held across the whole walker
+    loop (not per keystroke here) — see main() for why. This function only
+    reads; it does not touch termios.
+
+    Reads go through os.read(fd, ...) rather than sys.stdin.read(). That is
+    load-bearing, not a style choice: sys.stdin is a TextIOWrapper, and its
+    read(1) pulls the *entire* available kernel buffer into the text
+    layer's internal buffer on the first call, not just one byte. When an
+    arrow key arrives as a single burst ("\x1b[C"), the "[C" is already
+    sitting in that buffer after the first sys.stdin.read(1) — the
+    select() below then polls the underlying fd, finds nothing pending
+    (it's already been read into the text layer), times out, and a bare
+    ESC gets returned. The orphaned "[" and "C" then get misread as two
+    further keypresses on the next two loop iterations. Reading straight
+    from the fd keeps every byte visible to select() until this function
+    consumes it, so the escape continuation is never silently swallowed.
+    Do NOT "simplify" this back to sys.stdin.read() — that regression is
+    exactly what this replaced.
+    """
     fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":                      # arrow keys arrive as an escape seq
-            # A lone ESC is indistinguishable from the first byte of an arrow
-            # sequence until the rest either shows up or doesn't. Raw mode
-            # disables ISIG, so an unconditional read(2) here would block
-            # forever on a bare ESC with no Ctrl-C left to escape it — the
-            # user would be locked out with only two more keypresses as an
-            # exit. An arrow sequence's remaining bytes arrive together,
-            # well inside this window; a bare ESC never sends more, so a
-            # timeout here means "just ESC."
-            if select.select([sys.stdin], [], [], 0.05)[0]:
-                ch += sys.stdin.read(2)
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    ch = os.read(fd, 1).decode("latin-1")
+    if ch == "\x1b":                      # arrow keys arrive as an escape seq
+        # A lone ESC is indistinguishable from the first byte of an arrow
+        # sequence until the rest either shows up or doesn't. Raw mode
+        # disables ISIG, so an unconditional read(2) here would block
+        # forever on a bare ESC with no Ctrl-C left to escape it — the
+        # user would be locked out with only two more keypresses as an
+        # exit. An arrow sequence's remaining bytes arrive together,
+        # well inside this window; a bare ESC never sends more, so a
+        # timeout here means "just ESC."
+        if select.select([fd], [], [], 0.05)[0]:
+            ch += os.read(fd, 2).decode("latin-1")
+    return ch
 
 
 def _describe(colors_tuple, result) -> str:
@@ -285,11 +301,21 @@ def _load_verdicts() -> dict:
     if not VERDICTS.exists():
         return {}
     try:
-        return json.loads(VERDICTS.read_text())
+        data = json.loads(VERDICTS.read_text())
     except (OSError, json.JSONDecodeError) as e:
         print("warning: %s is unreadable (%s); starting from no verdicts"
               % (VERDICTS, e), file=sys.stderr)
         return {}
+    # `[1, 2, 3]`, `"x"`, and `null` all parse without error but aren't a
+    # verdicts mapping; letting one through here just moves the crash to the
+    # first .items()/.values() call downstream instead of catching it at the
+    # boundary where the file is actually read.
+    if not isinstance(data, dict):
+        print("warning: %s does not contain a JSON object (got %s); "
+              "starting from no verdicts"
+              % (VERDICTS, type(data).__name__), file=sys.stderr)
+        return {}
+    return data
 
 
 def _save_verdicts(verdicts: dict) -> None:
@@ -320,8 +346,8 @@ def main() -> int:
     # this tool's worst outcomes at once: the desktop stuck on a candidate
     # palette AND the terminal left in raw mode, the latter with no
     # signal-driven way to undo it. Raising SystemExit instead unwinds
-    # normally, so the existing `finally` (viewer teardown + revert) and
-    # _read_key's own termios restore both still run.
+    # normally, so the existing `finally` chain (terminal restore, viewer
+    # teardown, and revert) all still run.
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(1))
     ap = argparse.ArgumentParser(description=__doc__)
@@ -384,7 +410,19 @@ def main() -> int:
 
     i, showing_b, viewer, direction = 0, True, None, 1
     skipped_corrupt = 0
+    # Raw mode is entered once here and held for the whole walker loop,
+    # rather than toggled per keystroke inside _read_key(). Toggling it per
+    # key was the previous shape, but tcsetattr's default TCSADRAIN action
+    # discards whatever the kernel had already queued for this fd — so a
+    # burst like "\x1b[C" arriving while raw mode was briefly off between
+    # keystrokes could have its trailing bytes dropped before the next
+    # _read_key() call ever sees them. Holding raw mode across the loop
+    # means the queue is never flushed out from under an in-flight escape
+    # sequence.
+    stdin_fd = sys.stdin.fileno()
+    saved_term = termios.tcgetattr(stdin_fd)
     try:
+        tty.setraw(stdin_fd)
         while 0 <= i < len(files):
             path = files[i]
             pa, ra = render(path, a, args.mode)
@@ -396,8 +434,12 @@ def main() -> int:
                 # Advance in whatever direction the walker was already
                 # travelling so this can't get stuck bouncing at one index;
                 # running off either end exits the while loop normally.
+                # Moving left clamps at 0 rather than going negative — the
+                # same clamp the ordinary left-arrow branch below applies —
+                # so a corrupt cover at index 0 behaves like any other
+                # index 0, not like an exit request.
                 skipped_corrupt += 1
-                i += direction
+                i = max(0, i - 1) if direction < 0 else i + 1
                 continue
             _stop_viewer(viewer)
             viewer = subprocess.Popen(["imv", str(path)],
@@ -407,7 +449,7 @@ def main() -> int:
             try:
                 apply_wlchroma(*live)
             except CtlError as e:
-                print("\nwlchroma-ctl failed: %s" % e)
+                print("\r\nwlchroma-ctl failed: %s" % e, end="\r\n")
                 return 1
             # Mode is part of the key (IMPORTANT 4): the same cover/pairing
             # judged under --mode light must not silently overwrite the
@@ -416,18 +458,24 @@ def main() -> int:
             counts = {}
             for v in verdicts.values():
                 counts[v] = counts.get(v, 0) + 1
+            # Raw mode is held across this whole loop (see above), which
+            # disables OPOST — the terminal driver no longer expands a bare
+            # "\n" to "\r\n" on output. Every line printed here needs an
+            # explicit "\r\n" or the display stair-steps one column further
+            # right on each line.
             print("\033[2J\033[H", end="")
             print("[ %d/%d ] %-28s verdicts: A %d  B %d  = %d"
                   % (i + 1, len(files), path.name,
-                     counts.get("a", 0), counts.get("b", 0), counts.get("=", 0)))
+                     counts.get("a", 0), counts.get("b", 0), counts.get("=", 0)),
+                  end="\r\n")
             print(" %s A  %-12s %s" % (" " if showing_b else "▶", a.name,
-                                       _describe(pa, ra)))
+                                       _describe(pa, ra)), end="\r\n")
             print(" %s B  %-12s %s" % ("▶" if showing_b else " ", b.name,
-                                       _describe(pb, rb)))
+                                       _describe(pb, rb)), end="\r\n")
             if key in verdicts:
-                print("   recorded: %s" % verdicts[key])
+                print("   recorded: %s" % verdicts[key], end="\r\n")
             print("   [space] toggle   [a/b/=] verdict   "
-                  "[←/→] cover   [q] quit")
+                  "[←/→] cover   [q] quit", end="\r\n")
 
             ch = _read_key()
             if ch == " ":
@@ -446,20 +494,27 @@ def main() -> int:
             elif ch in ("q", "\x03"):
                 break
     finally:
-        # Never leave an orphaned viewer or the desktop stuck on a candidate.
-        # Nested, not sequential (CRITICAL 1): a second Ctrl-C landing inside
-        # _stop_viewer's wait() — bounded, or unbounded after kill() — raises
-        # KeyboardInterrupt right there. If revert_wlchroma() ran after it in
-        # the same block, that interrupt would skip the revert and strand the
-        # desktop on a candidate palette. Nesting means a failure in either
-        # step cannot suppress the other.
+        # Never leave an orphaned viewer, the desktop stuck on a candidate,
+        # or the terminal stuck in raw mode. Nested, not sequential
+        # (CRITICAL 1): a second Ctrl-C landing inside _stop_viewer's
+        # wait() — bounded, or unbounded after kill() — raises
+        # KeyboardInterrupt right there. If a later step ran after it in
+        # the same block, that interrupt would skip that step. Nesting
+        # means a failure in any one step cannot suppress the others below
+        # it: termios restore is outermost so every exit path — including
+        # one that fails partway through viewer teardown or revert — still
+        # leaves the terminal usable, which matters more than either of
+        # those two once something has already gone wrong.
         try:
-            _stop_viewer(viewer)
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_term)
         finally:
             try:
-                revert_wlchroma()
-            except CtlError:
-                pass
+                _stop_viewer(viewer)
+            finally:
+                try:
+                    revert_wlchroma()
+                except CtlError:
+                    pass
     print("\nverdicts saved to %s" % VERDICTS)
     if skipped_corrupt:
         print("(%d corrupt cover(s) skipped — no verdict recorded)"
