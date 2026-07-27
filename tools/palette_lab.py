@@ -40,7 +40,7 @@ VERDICTS = Path(__file__).resolve().parent / "verdicts.json"
 # The fallback triple the pipeline returns for a cover it correctly refuses to
 # decode (SEC-005) — every slot identical, so it can never arise from a real
 # extraction (selection always rejects near-duplicate picks at SELECT_MIN_DE).
-_FALLBACK = ("#a48ec7",) * 3
+_FALLBACK: tuple[str, str, str] = ("#a48ec7", "#a48ec7", "#a48ec7")
 
 
 class RenderOutcome(enum.Enum):
@@ -204,7 +204,8 @@ def render(path: Path, cand: Candidate, mode: str
     try:
         toned = _assist(tone_mod.tone(picked, mode), cand.yellow_assist, cand.hi)
         slots, result = tone_mod.separate(toned, mode, n)
-        return tuple(s.to_hex() for s in slots), result
+        c1, c2, c3 = (s.to_hex() for s in slots)
+        return (c1, c2, c3), result
     finally:
         (tone_mod.ENVELOPES[mode], tone_mod.GAMMA[mode], tone_mod.SPREAD_GAIN,
          tone_mod.CHROMA_FRAC, tone_mod.MIN_DE) = saved
