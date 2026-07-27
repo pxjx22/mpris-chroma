@@ -417,6 +417,15 @@ class ColorDataBoundsTest(unittest.TestCase):
         self.assertNotEqual(extract_colors(p), (DEFAULT_ACCENT,) * 3)
 
 
+# Below this chroma, the hue angle is dominated by 8-bit output quantization
+# rather than by anything the pipeline did: quantization perturbs Oklab
+# (a, b) by roughly 0.002, which produces an angular error of about
+# atan(0.002 / C). For that error to stay inside this test's own 0.05 rad
+# hue tolerance, chroma must exceed quantization_noise / tan(tolerance) =
+# 0.002 / tan(0.05) ~= 0.0400. Below that, atan2 amplifies a fixed cartesian
+# perturbation into a hue swing that looks like a mode-flip defect but isn't.
+HUE_MEANINGFUL_C = 0.04
+
 _CORPUS_DIRS = [Path.home() / ".local/share/jellyfin-tui/covers",
                 Path.home() / ".cache/mpris-chroma/covers"]
 
@@ -453,10 +462,30 @@ class CorpusTest(unittest.TestCase):
         self.assertGreater(lums[9 * len(lums) // 10], lums[len(lums) // 10] * 2)
 
     def test_light_is_brighter_than_dark_for_every_cover(self):
+        # A handful of cached covers are corrupted downloads (HTML error
+        # pages, a "server loading" stub, etc). The security guard correctly
+        # refuses to decode them by signature and returns DEFAULT_ACCENT
+        # identically in both modes — that cover exercised no toning at all,
+        # so it has nothing to say about light-vs-dark brightness and is out
+        # of scope for this comparison.
+        #
+        # But dropping it silently would let a real regression — every cover
+        # falling back — turn this test green while the product is broken.
+        # So the exclusion is bounded: fallbacks must stay a small minority
+        # of the corpus (measured 7 of ~195 cached covers; 10% leaves room
+        # for a few more bad downloads while still failing loudly on a
+        # wholesale failure).
+        fallback_count = 0
         for cover, d, l in zip(self.covers, self.dark, self.light):
+            if d == (DEFAULT_ACCENT,) * 3 and l == (DEFAULT_ACCENT,) * 3:
+                fallback_count += 1
+                continue
             with self.subTest(cover=cover.name):
                 self.assertGreater(ramp.mean_luminance(*l),
                                    ramp.mean_luminance(*d))
+        self.assertLess(fallback_count, 0.10 * len(self.covers),
+                         "too many covers fell back to the default triple — "
+                         "possible extraction regression, not bad downloads")
 
     def test_light_mode_does_not_cluster_at_the_top(self):
         # The defect the old BANDS["light"] = 0.70-0.97 had: every cover crushed
@@ -469,10 +498,14 @@ class CorpusTest(unittest.TestCase):
         for cover, d, l in zip(self.covers, self.dark, self.light):
             for cd, cl in zip(d, l):
                 with self.subTest(cover=cover.name):
-                    hd = oklab.hex_to_lch(cd)[2]
-                    hl = oklab.hex_to_lch(cl)[2]
-                    if oklab.hex_to_lch(cd)[1] < NEUTRAL_C:
-                        continue   # a neutral has no meaningful hue angle
+                    _, Cd, hd = oklab.hex_to_lch(cd)
+                    _, Cl, hl = oklab.hex_to_lch(cl)
+                    # A slot can be chromatic in one mode and near-grey in the
+                    # other (toning moves lightness, which moves how much of
+                    # the gamut-clamped chroma survives) — both sides must
+                    # clear the meaningful-hue floor, not just one.
+                    if Cd < HUE_MEANINGFUL_C or Cl < HUE_MEANINGFUL_C:
+                        continue
                     delta = abs((hd - hl + math.pi) % (2 * math.pi) - math.pi)
                     self.assertLess(delta, 0.05)
 
