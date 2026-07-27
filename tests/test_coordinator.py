@@ -1,9 +1,11 @@
 import unittest
 from pathlib import Path
 
-from mpris_chroma.coordinator import (RETRY_BASE_MS, RETRY_CAP_MS,
-                                      RETRY_MAX_ATTEMPTS, Coordinator,
-                                      backoff_delay_ms, mode_from_color_scheme)
+from mpris_chroma.coordinator import (DROP_LOG_INTERVAL, RETRY_BASE_MS,
+                                      RETRY_CAP_MS, RETRY_MAX_ATTEMPTS,
+                                      Coordinator, backoff_delay_ms,
+                                      mode_from_color_scheme)
+from mpris_chroma.sync import PLAYERS
 from mpris_chroma.worker import (COMMITTED, FAILED_RETRYABLE, REJECTED,
                                  CoverTarget, Desired, Result)
 
@@ -19,11 +21,12 @@ def _line(name, status, art=""):
 
 
 class _Harness:
-    def __init__(self, mode="dark"):
+    def __init__(self, mode="dark", allowed_players=PLAYERS):
         self.submitted = []
         self.scheduled = []   # (delay_ms, fn) per armed retry timer
         self.cancelled = []   # handles passed to cancel
         self._next_handle = 0
+        self.clock = 0.0      # injected monotonic clock (drop-log rate limiting)
         self.coord = Coordinator(
             submit=self.submitted.append,
             covers_dir_for=_covers_dir_for,
@@ -31,6 +34,8 @@ class _Harness:
             schedule=self._schedule,
             cancel=self.cancelled.append,
             jitter=lambda: 1.0,   # deterministic in tests
+            allowed_players=allowed_players,
+            now=lambda: self.clock,
         )
 
     def _schedule(self, delay_ms, fn):
@@ -445,6 +450,137 @@ class RankingTest(unittest.TestCase):
         h.coord.adopt(Result(h.last[0], REJECTED, None))
         h.coord.on_line(_line("spotify", "Playing", "https://x/good"))
         self.assertEqual(h.last[1].target, CoverTarget("https://x/good", None))
+
+
+class LineValidationTest(unittest.TestCase):
+    """SEC-011 §2: semantic validation of every playerctl line.
+
+    The injection vector is field CONTENT, not line length: playerctl renders
+    {{mpris:artUrl}} raw, so a hostile MPRIS peer can embed a newline (forging a
+    whole line) or a tab (forging extra fields) inside its own artUrl. Framing
+    cannot tell a forged-but-well-formed line from a real one; validation can
+    tell that its NAME was never one we asked playerctl to follow.
+    """
+
+    def test_line_with_extra_fields_is_rejected(self):
+        # A tab inside artUrl yields >3 fields. Never salvage parts[:3]: that
+        # would silently truncate an attacker-shaped URL and act on the prefix.
+        h = _Harness()
+        h.coord.on_line("spotify\tPlaying\thttps://x/a\tPlaying\thttps://evil\n")
+        self.assertEqual(h.submitted, [])
+
+    def test_line_with_too_few_fields_is_rejected(self):
+        # Asserted on state, not on submissions: a 2-field line happens to
+        # submit nothing anyway (no art source -> hold), so only the absence of
+        # a state update distinguishes "rejected" from "accepted and idle".
+        h = _Harness()
+        h.coord.on_line("spotify\tPlaying\n")
+        self.assertEqual(h.coord.players, {})
+
+    def test_empty_art_url_is_still_three_fields_and_accepted(self):
+        # playerctl renders an absent artUrl as an empty third field. The
+        # exactly-3 rule must not mistake the common case for malformed input.
+        h = _Harness()
+        h.coord.on_line("jellyfin-tui\tPlaying\t\n")
+        self.assertEqual(len(h.submitted), 1)
+        self.assertEqual(h.last[1].target, CoverTarget("", _JF_DIR))
+
+    def test_forged_line_naming_an_unfollowed_player_is_rejected(self):
+        # The artUrl-newline injection: the forged line is perfectly well-formed,
+        # but its name is not one we asked playerctl to follow.
+        h = _Harness()
+        h.coord.on_line(_line("evilplayer", "Playing", "https://evil/a"))
+        self.assertEqual(h.submitted, [])
+        self.assertEqual(h.coord.players, {})
+
+    def test_instance_suffixed_name_is_accepted(self):
+        # Verified against playerctl on the session bus: --player=spotify
+        # matches org.mpris.MediaPlayer2.spotify.instance42, and playerctl
+        # renders the FULL dotted name as {{playerName}}. Accepting the suffixed
+        # form is therefore necessary, not merely tolerant.
+        h = _Harness()
+        h.coord.on_line(_line("spotify.instance42", "Playing", "https://x/a"))
+        self.assertEqual(len(h.submitted), 1)
+
+    def test_lookalike_prefixed_name_is_rejected(self):
+        # The rule is `base` or `base + "."`, never a bare prefix — otherwise
+        # `spotifyevil` rides in on `spotify`. Same probe: playerctl itself
+        # rejected the lookalike.
+        h = _Harness()
+        h.coord.on_line(_line("spotifyevil", "Playing", "https://x/a"))
+        self.assertEqual(h.submitted, [])
+
+    def test_allowlist_comes_from_the_configured_player_set(self):
+        # Single source of truth: the coordinator is handed the SAME string
+        # passed to `playerctl --player=`, so the two lists cannot drift.
+        h = _Harness(allowed_players="onlythis")
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        self.assertEqual(h.submitted, [])
+        h.coord.on_line(_line("onlythis", "Playing", "https://x/a"))
+        self.assertEqual(len(h.submitted), 1)
+
+    def test_unknown_status_is_rejected_not_treated_as_stopped(self):
+        # BEHAVIOR CHANGE: an unrecognized status used to fall through as
+        # not-playing and contribute to a revert. Now the line is dropped and
+        # prior state is retained — MPRIS defines exactly three values, so a
+        # fourth is not a real player's output.
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        h.coord.on_line(_line("spotify", "Bogus", "https://x/a"))
+        self.assertEqual(len(h.submitted), 1)  # no revert submitted
+        self.assertEqual(h.coord.players["spotify"].status, "Playing")
+
+    def test_rejected_line_mutates_nothing(self):
+        h = _Harness()
+        h.coord.on_line(_line("spotify", "Playing", "https://x/a"))
+        players, seq, covers = dict(h.coord.players), h.coord.seq, dict(h.coord.covers)
+        for bad in ("garbage\n", "spotify\tPlaying\n",
+                    _line("evilplayer", "Playing", "u"),
+                    _line("spotify", "Bogus", "u"),
+                    "spotify\tPlaying\tu\textra\n"):
+            h.coord.on_line(bad)
+        self.assertEqual(h.coord.players, players)
+        self.assertEqual(h.coord.seq, seq)      # no seq bump: ranking untouched
+        self.assertEqual(h.coord.covers, covers)
+        self.assertEqual(len(h.submitted), 1)
+
+
+class DropLogTest(unittest.TestCase):
+    """One shared rate limiter across every drop category (§2.4): a garbage
+    flood must not become a journal flood, and a noisy category must not starve
+    another category's first warning."""
+
+    def test_repeated_drops_in_one_category_log_once_per_interval(self):
+        h = _Harness()
+        with self.assertLogs("mpris_chroma.coordinator", "WARNING") as cm:
+            for _ in range(50):
+                h.coord.on_line(_line("evilplayer", "Playing", "https://evil/a"))
+        self.assertEqual(len(cm.output), 1)
+
+    def test_a_category_logs_again_after_the_interval(self):
+        h = _Harness()
+        with self.assertLogs("mpris_chroma.coordinator", "WARNING") as cm:
+            h.coord.on_line(_line("evilplayer", "Playing", "u"))
+            h.clock += DROP_LOG_INTERVAL
+            h.coord.on_line(_line("evilplayer", "Playing", "u"))
+        self.assertEqual(len(cm.output), 2)
+
+    def test_categories_are_limited_independently(self):
+        h = _Harness()
+        with self.assertLogs("mpris_chroma.coordinator", "WARNING") as cm:
+            h.coord.on_line(_line("evilplayer", "Playing", "u"))   # bad name
+            h.coord.on_line(_line("spotify", "Bogus", "u"))        # bad status
+            h.coord.on_line("spotify\tPlaying\n")                  # bad field count
+        self.assertEqual(len(cm.output), 3)
+
+    def test_framer_drops_share_the_same_limiter(self):
+        # sync wires the framer's oversize drops (unit 2) through this same
+        # entry point, so an oversize flood obeys the same one-per-interval rule.
+        h = _Harness()
+        with self.assertLogs("mpris_chroma.coordinator", "WARNING") as cm:
+            for _ in range(10):
+                h.coord.log_drop("oversize", "line exceeded the frame limit")
+        self.assertEqual(len(cm.output), 1)
 
 
 if __name__ == "__main__":

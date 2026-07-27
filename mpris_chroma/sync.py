@@ -167,7 +167,10 @@ def main():
 
     coordinator = Coordinator(submit=_submit, covers_dir_for=COVERS_DIRS.get,
                               mode=mode, schedule=_schedule_retry,
-                              cancel=GLib.source_remove)
+                              cancel=GLib.source_remove,
+                              # Same value as `--player=` in _follow_cmd, so the
+                              # follow set and the accept set cannot drift.
+                              allowed_players=PLAYERS)
 
     def _post(result):
         # Marshal a worker result to the main thread; return False so the idle

@@ -10,6 +10,7 @@ impossible (design guarantee a).
 
 import logging
 import random
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,15 @@ _log = logging.getLogger("mpris_chroma.coordinator")
 _log.addHandler(logging.NullHandler())
 
 MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+
+# The complete MPRIS PlaybackStatus domain (SEC-011 §2.3). A line carrying
+# anything else did not come from a spec-compliant player.
+_MPRIS_STATUSES = frozenset({"Playing", "Paused", "Stopped"})
+
+# Dropped-input logging (SEC-011 §2.4): one warning per category per interval,
+# so a garbage flood cannot turn into a journal flood. Categories are limited
+# independently, so a noisy one cannot mask another's first warning.
+DROP_LOG_INTERVAL = 60.0
 
 # Retry backoff (SEC-018): capped exponential with jitter, then terminal. Three
 # attempts at 1s/2s/4s ≈ 7s total, so a genuinely-absent cover (e.g. a player
@@ -93,8 +103,9 @@ class Coordinator:
     def __init__(self, *, submit: Callable[[tuple[int, Desired]], None],
                  covers_dir_for: Callable[[str], Path | None], mode: Mode = "dark",
                  schedule: Callable[[int, Callable[[], None]], object],
-                 cancel: Callable[[object], None],
-                 jitter: Callable[[], float] = _default_jitter):
+                 cancel: Callable[[object], None], allowed_players: str,
+                 jitter: Callable[[], float] = _default_jitter,
+                 now: Callable[[], float] = time.monotonic):
         self.players: dict[str, PlayerState] = {}
         self.covers: dict[str, CoverState] = {}    # per-player resolution state
         self.seq = 0
@@ -122,17 +133,48 @@ class Coordinator:
         self._retry_desire: Desired | None = None  # desire the attempts count against
         self._retry_player: str | None = None      # player the armed retry is for
         self._retry_attempt = 0
+        # The SAME string handed to `playerctl --player=` (SEC-011 §2.2), so the
+        # follow set and the accept set cannot drift.
+        self._allowed_bases = tuple(
+            p for p in (part.strip() for part in allowed_players.split(",")) if p)
+        self._now = now
+        self._last_drop_log: dict[str, float] = {}
+
+    def log_drop(self, category: str, detail: str) -> None:
+        """Warn about dropped input, rate-limited per category. Public because
+        unit 2's framer reports its oversize drops through the same limiter."""
+        t = self._now()
+        if t - self._last_drop_log.get(category, float("-inf")) >= DROP_LOG_INTERVAL:
+            self._last_drop_log[category] = t
+            _log.warning("dropped playerctl input (%s): %s", category, detail)
 
     # --- GLib-driven event handlers (main thread) ---------------------------
 
     def on_line(self, line: str) -> None:
-        """Parse one 'name\\tstatus\\tartUrl' playerctl line, update that
-        player's state and cover-state, and (re)decide. Does no I/O."""
+        """Validate and parse one 'name\\tstatus\\tartUrl' playerctl line, update
+        that player's state and cover-state, and (re)decide. Does no I/O.
+
+        This is the trust boundary for player-controlled bytes (SEC-011 §2): a
+        rejected line mutates nothing — no player state, no seq bump, no
+        decision — so a hostile peer cannot move the pipeline with forged input.
+        """
         parts = line.rstrip("\n").split("\t")
-        if len(parts) < 2:
+        if len(parts) != 3:
+            # Exactly three fields or nothing — never salvage parts[:3]. A tab
+            # inside artUrl (playerctl renders it raw) produces extra fields,
+            # and acting on the truncated prefix would apply an attacker-shaped
+            # URL that the real player never published.
+            self.log_drop("fields", f"expected 3 fields, got {len(parts)}")
             return
-        name, status = parts[0], parts[1]
-        art_url = parts[2] if len(parts) > 2 else ""
+        name, status, art_url = parts
+        if not self._allowed_name(name):
+            self.log_drop("name", "line named a player we do not follow")
+            return
+        if status not in _MPRIS_STATUSES:
+            # MPRIS defines exactly these three. Dropping (rather than treating
+            # an unknown value as not-playing, as before) keeps prior state.
+            self.log_drop("status", "unrecognized playback status")
+            return
         self.seq += 1
         self.players[name] = PlayerState(status, art_url, self.seq)
         # Cover-state maintenance (§3): a new art identity resets to PENDING;
@@ -232,6 +274,20 @@ class Coordinator:
         self._cancel_retry()
 
     # --- internals ----------------------------------------------------------
+
+    def _allowed_name(self, name: str) -> bool:
+        """Is this one of the players we asked playerctl to follow?
+
+        Mirrors playerctl's own `--player=` matching, which ignores the MPRIS
+        `.instanceN` suffix: a name is allowed iff it equals a configured base
+        or starts with base + "." — never a bare prefix, or `spotifyevil` would
+        ride in on `spotify`. Verified against playerctl on the session bus:
+        it matched an instance-suffixed name, rejected the lookalike, and
+        rendered the full dotted name as {{playerName}} — so accepting the
+        suffixed form is required, not merely tolerant.
+        """
+        return any(name == base or name.startswith(base + ".")
+                   for base in self._allowed_bases)
 
     def _art_identity(self, name: str, art_url: str) -> tuple | None:
         """The cover-state key (§3): the art_url when present, else the player's
