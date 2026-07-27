@@ -11,8 +11,11 @@ numbered async-pipeline audit sequence (4a–4d); the SEC-018 state-machine work
 merged and out of scope. Spec lives outside the root `<phase>-design.md` naming
 to keep the two apart.
 
-**Branch:** `quality/palette-toning`, cut from `main` at `4ac796d`.
-**Baseline:** suite 224 (221 default + 3 opt-in skipped), green.
+**Branch:** `worktree-quality+palette-toning`, in an isolated worktree at
+`.claude/worktrees/quality+palette-toning`, based at `b14e9f9`. Isolated because
+a concurrent session is working the 4d audit phase in the main checkout; the
+only expected contention at merge time is `README.md`.
+**Baseline:** suite 224 (221 default + 3 opt-in skipped), green in the worktree.
 
 Design approved in conversation on the points below; this is the TDD contract.
 
