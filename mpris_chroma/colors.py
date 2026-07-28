@@ -197,3 +197,42 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
     """
     picks, n_distinct = select_palette(image_path)
     return render_palette(picks, n_distinct, mode, label=image_path.name)
+
+
+class PaletteMemo:
+    """One-slot memo over the mode-free half of extraction.
+
+    A theme flip re-runs the pipeline for an unchanged cover: the worker's dedup
+    key is (content_id, mode), so a mode change misses it and reaches extract.
+    But only `mode` changed, and select_palette does not depend on mode, so its
+    result is reusable — turning a ~6.2 ms decode into a ~0.01 ms retone.
+
+    One slot, because the access pattern a flip produces is exactly
+    (cover X, dark) -> (cover X, light). No eviction policy, no size bound, no
+    TTL — none of which can then be got wrong.
+
+    Keyed on the content_id cover.py derives for SEC-018, so an in-place
+    overwrite of a cover changes the key and misses. Not keyed on the path.
+
+    Not thread-safe, and does not need to be: `extract` is called only from the
+    single worker thread (worker.py `_serve`).
+    """
+
+    def __init__(self, select=select_palette, render=render_palette):
+        self._select = select
+        self._render = render
+        self._key: tuple[int, int] | None = None
+        self._value: tuple[list[tuple[float, float, float]], int] | None = None
+
+    def __call__(self, image_path: Path, mode: str,
+                 content_id: tuple[int, int]) -> tuple[str, str, str]:
+        if content_id != self._key:
+            # Value first, key second, and it matters. If _select raises, the
+            # old key and old value stay consistent with each other. Setting
+            # the key first would leave it pointing at a value that was never
+            # computed, and every later flip on this cover would silently serve
+            # the *previous* cover's palette.
+            self._value = self._select(image_path)
+            self._key = content_id
+        picks, n_distinct = self._value
+        return self._render(picks, n_distinct, mode, label=image_path.name)
