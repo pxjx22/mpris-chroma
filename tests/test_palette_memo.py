@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mpris_chroma.colors import PaletteMemo, render_palette, select_palette
+from mpris_chroma.colors import PaletteMemo
 
 
 def _memo(select=None, render=None):
