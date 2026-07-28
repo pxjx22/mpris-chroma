@@ -143,6 +143,45 @@ def _select(hist: list[tuple[int, tuple[float, float, float]]]
     return picked, n_distinct
 
 
+def select_palette(image_path: Path
+                   ) -> tuple[list[tuple[float, float, float]], int]:
+    """Content-derived half of extraction: decode, quantize, rank, pick.
+
+    Mode-free by construction — the picks depend only on the cover's pixels, so
+    a caller may reuse this result across theme changes (see PaletteMemo).
+    Returns ([], 0) for a cover that yields no extractable colors (rejected
+    format, undecodable data, or a genuine no-color image); render_palette maps
+    that to the default accent.
+    """
+    hist = _histogram(image_path)
+    if not hist:
+        # Log here rather than at the caller so a memoized failure is reported
+        # once per cover instead of once per theme flip.
+        _log.warning("no extractable colors from %s; using default palette",
+                     image_path.name)
+        return [], 0
+    return _select(hist)
+
+
+def render_palette(picks: list[tuple[float, float, float]], n_distinct: int,
+                   mode: str, *, label: str = "?") -> tuple[str, str, str]:
+    """Mode-derived half: tone into the mode's Oklab envelope, then separate.
+
+    `label` names the cover in the diagnostic below only; it has no effect on
+    the palette. It exists because this half no longer holds the path.
+    """
+    if not picks:
+        return "#a48ec7", "#a48ec7", "#a48ec7"
+    toned = tone(picks, mode)
+    slots, result = separate(toned, mode, n_distinct)
+    if not result.resolved and result.reason != "duplicates":
+        # An unseparable palette is an accepted outcome, but never a silent one.
+        _log.debug("palette for %s left a pair at dE %.3f (%s)",
+                   label, result.residual_de, result.reason)
+    c1, c2, c3 = (slot.to_hex() for slot in slots)
+    return c1, c2, c3
+
+
 def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]:
     """Extract the three most prominent, visibly distinct colors from an image.
 
@@ -152,22 +191,9 @@ def extract_colors(image_path: Path, mode: str = "dark") -> tuple[str, str, str]
     if two of them collide perceptually. No hues are ever invented; the three
     slots are real cover colors. If the cover has fewer than three distinct
     colors, the last one is repeated rather than fabricated.
-    """
-    hist = _histogram(image_path)
-    if not hist:
-        # Rejected format, undecodable data, or a genuine no-color image: fall
-        # back to the default accent, but log it so a persistently unreadable
-        # cover is diagnosable rather than a silent, wrong-looking palette.
-        _log.warning("no extractable colors from %s; using default palette",
-                     image_path.name)
-        return "#a48ec7", "#a48ec7", "#a48ec7"
 
-    picked, n_distinct = _select(hist)
-    toned = tone(picked, mode)
-    slots, result = separate(toned, mode, n_distinct)
-    if not result.resolved and result.reason != "duplicates":
-        # An unseparable palette is an accepted outcome, but never a silent one.
-        _log.debug("palette for %s left a pair at dE %.3f (%s)",
-                   image_path.name, result.residual_de, result.reason)
-    c1, c2, c3 = (slot.to_hex() for slot in slots)
-    return c1, c2, c3
+    The uncached composition of select_palette and render_palette. Kept as the
+    reference implementation: PaletteMemo must agree with it exactly.
+    """
+    picks, n_distinct = select_palette(image_path)
+    return render_palette(picks, n_distinct, mode, label=image_path.name)

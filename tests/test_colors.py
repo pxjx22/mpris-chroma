@@ -1,4 +1,5 @@
 import colorsys
+import inspect
 import math
 import tempfile
 import unittest
@@ -194,6 +195,44 @@ class ModeIndependenceTest(unittest.TestCase):
                 with self.subTest(color=out):
                     delta = abs(oklab.hex_to_lch(out)[2] - src[2])
                     self.assertLess(delta, HUE_QUANTIZATION_TOLERANCE)
+
+
+class SplitPipelineTest(unittest.TestCase):
+    """The two halves of extraction, addressable separately so a caller can
+    cache the mode-free one."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_select_palette_is_mode_free_and_returns_picks_with_count(self):
+        img = self.tmp / "s.png"
+        _thirds(img, "#d12b2b", "#2b7fd1", "#e0d020")
+        picks, n = colors.select_palette(img)
+        self.assertEqual(n, 3)
+        self.assertEqual(len(picks), 3)
+        self.assertNotIn("mode", inspect.signature(colors.select_palette).parameters)
+
+    def test_select_palette_reports_empty_for_an_unreadable_cover(self):
+        p = self.tmp / "not.png"
+        p.write_bytes(b"this is not an image")
+        self.assertEqual(colors.select_palette(p), ([], 0))
+
+    def test_render_palette_maps_the_empty_selection_to_the_default(self):
+        self.assertEqual(colors.render_palette([], 0, "dark"),
+                         (DEFAULT_ACCENT,) * 3)
+
+    def test_render_palette_composes_back_into_extract_colors(self):
+        img = self.tmp / "c.png"
+        _thirds(img, "#d12b2b", "#2b7fd1", "#e0d020")
+        for mode in ("dark", "light"):
+            with self.subTest(mode=mode):
+                picks, n = colors.select_palette(img)
+                self.assertEqual(colors.render_palette(picks, n, mode),
+                                 extract_colors(img, mode))
 
 
 class PipelineInvariantTest(unittest.TestCase):
