@@ -552,5 +552,25 @@ class CorpusTest(unittest.TestCase):
                     self.assertLess(delta, 0.05)
 
 
+@unittest.skipUnless(len(_corpus()) >= 20,
+                     "real cover corpus not present (opt-in)")
+class MemoEquivalenceTest(unittest.TestCase):
+    """The memo must be a pure optimization: same output as the uncached
+    composition, on every real cover, in both modes. This is what makes
+    extract_colors worth keeping as the reference."""
+
+    def test_memo_matches_uncached_extract_over_the_corpus(self):
+        for p in _corpus():
+            st = p.stat()
+            cid = (st.st_size, st.st_mtime_ns)
+            memo = colors.PaletteMemo()
+            for mode in ("dark", "light"):
+                # Same memo across both modes, so the second call is a hit --
+                # a hit that returned different colors is the bug this catches.
+                with self.subTest(cover=p.name, mode=mode):
+                    self.assertEqual(memo(p, mode, cid),
+                                     extract_colors(p, mode))
+
+
 if __name__ == "__main__":
     unittest.main()
