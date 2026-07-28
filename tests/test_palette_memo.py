@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from mpris_chroma.colors import PaletteMemo
+from mpris_chroma.colors import PaletteMemo, render_palette
 
 
 def _memo(select=None, render=None):
@@ -58,3 +58,70 @@ class PaletteMemoMissTest(unittest.TestCase):
         memo(Path("/c/a.jpg"), "dark", (10, 100))
         memo(Path("/c/b.jpg"), "dark", (10, 100))
         self.assertEqual(len(calls), 1)
+
+
+DEFAULT_ACCENT = "#a48ec7"
+
+
+def _counting_select(calls, boom):
+    """A select fake that records every call and can be armed to raise.
+
+    Shared by both exception tests: they differ in what they assert after the
+    failure, not in how the failure is produced.
+    """
+    def select(p):
+        calls.append(p)
+        if boom["on"]:
+            raise MemoryError("decode blew up")
+        return ([(0.5, 0.1, 1.0)], len(calls))
+    return select
+
+
+class PaletteMemoFailureTest(unittest.TestCase):
+    def test_an_unextractable_cover_is_cached_as_the_default(self):
+        # Caching the failure is deliberate: it turns the "no extractable
+        # colors" warning from once-per-flip into once-per-cover. Safe because
+        # a rewritten file changes content_id and misses.
+        calls = []
+        memo = _memo(select=lambda p: calls.append(p) or ([], 0),
+                     render=render_palette)
+        cid = (10, 100)
+        self.assertEqual(memo(Path("/c/bad.jpg"), "dark", cid),
+                         (DEFAULT_ACCENT,) * 3)
+        self.assertEqual(memo(Path("/c/bad.jpg"), "light", cid),
+                         (DEFAULT_ACCENT,) * 3)
+        self.assertEqual(len(calls), 1)
+
+
+class PaletteMemoExceptionSafetyTest(unittest.TestCase):
+    def test_a_raising_select_does_not_poison_the_slot(self):
+        # The failure mode this memo most needs guarding: if the key were
+        # assigned before the value, a select that raises would leave the slot
+        # claiming the NEW key while holding the OLD picks, and the retry below
+        # would be served the previous cover's palette without re-selecting.
+        calls, boom = [], {"on": False}
+        memo = _memo(select=_counting_select(calls, boom),
+                     render=lambda picks, n, mode, label="?": (str(n),) * 3)
+        memo(Path("/a.jpg"), "dark", (10, 100))           # slot holds A
+        boom["on"] = True
+        with self.assertRaises(MemoryError):
+            memo(Path("/b.jpg"), "dark", (20, 200))       # raises mid-update
+        boom["on"] = False
+        memo(Path("/b.jpg"), "dark", (20, 200))           # must RE-select B
+
+        # Three calls: A, the failed B, the successful B. With key-before-value
+        # ordering this is 2 -- the last call hits a slot that wrongly claims
+        # (20, 200) and returns A's palette.
+        self.assertEqual(len(calls), 3)
+
+    def test_the_slot_still_serves_the_old_cover_after_a_failure(self):
+        calls, boom = [], {"on": False}
+        memo = _memo(select=_counting_select(calls, boom),
+                     render=lambda picks, n, mode, label="?": (str(n),) * 3)
+        first = memo(Path("/a.jpg"), "dark", (10, 100))
+        boom["on"] = True
+        with self.assertRaises(MemoryError):
+            memo(Path("/b.jpg"), "dark", (20, 200))
+        # A's key was never overwritten, so this is still a hit: 2 calls, not 3.
+        self.assertEqual(memo(Path("/a.jpg"), "light", (10, 100)), first)
+        self.assertEqual(len(calls), 2)
