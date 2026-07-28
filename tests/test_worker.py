@@ -19,7 +19,7 @@ def _worker(**overrides):
     calls = overrides.pop("_calls", None)
     kw = dict(
         resolve=lambda art, covers_dir: _ready(),
-        extract=lambda path, mode: ("#aa0000", "#00bb00", "#0000cc"),
+        extract=lambda path, mode, content_id: ("#aa0000", "#00bb00", "#0000cc"),
         apply=lambda c1, c2, c3: None,
         revert=lambda: None,
         report=lambda result: None,
@@ -38,6 +38,17 @@ class WorkerRunOnceApplyTest(unittest.TestCase):
         self.assertEqual(result.outcome, "committed")
         self.assertEqual(applied, [("#aa0000", "#00bb00", "#0000cc")])
 
+    def test_extract_receives_the_resolved_content_id(self):
+        # The memo keys on content identity, so the worker must hand over the
+        # identity it already resolved rather than let extract derive a second.
+        seen = []
+        w, _ = _worker(
+            resolve=lambda a, c: _ready(content_id=(42, 4242)),
+            extract=lambda p, m, cid: seen.append(cid) or ("#1", "#2", "#3"))
+        target = CoverTarget(art_url="http://x", covers_dir=None)
+        w._run_once((5, Desired(target=target, mode="dark")))
+        self.assertEqual(seen, [(42, 4242)])
+
 
 class WorkerRunOnceFailureTest(unittest.TestCase):
     def _apply_target(self):
@@ -47,7 +58,7 @@ class WorkerRunOnceFailureTest(unittest.TestCase):
         extracted, applied = [], []
         w, _ = _worker(
             resolve=lambda a, c: Retryable("network"),
-            extract=lambda p, m: extracted.append((p, m)) or ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: extracted.append((p, m)) or ("#1", "#2", "#3"),
             apply=lambda *c: applied.append(c),
         )
         result = w._run_once((5, self._apply_target()))
@@ -81,7 +92,7 @@ class WorkerSupersededTest(unittest.TestCase):
     def _worker_with_mailbox(self, mb, **overrides):
         kw = dict(
             resolve=lambda a, c: _ready(),
-            extract=lambda p, m: ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: ("#1", "#2", "#3"),
             apply=lambda *c: None,
             revert=lambda: None,
             report=lambda result: None,
@@ -114,7 +125,7 @@ class WorkerSupersededTest(unittest.TestCase):
         applied = []
         mb = Mailbox()
 
-        def extract_then_supersede(path, mode):
+        def extract_then_supersede(path, mode, content_id):
             mb.put((9, Desired(CoverTarget("http://z", None), "dark")))  # newer arrives
             return ("#1", "#2", "#3")
 
@@ -144,7 +155,7 @@ class WorkerServeTest(unittest.TestCase):
         mb = Mailbox()
         w = Worker(
             mb, resolve=lambda a, c: _ready(),
-            extract=lambda p, m: ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: ("#1", "#2", "#3"),
             apply=lambda *c: None, revert=lambda: None, report=reported.append,
         )
         mb.put((9, Desired(CoverTarget("http://y", None), "dark")))
@@ -158,7 +169,7 @@ class WorkerServeTest(unittest.TestCase):
         reported = []
         w, _ = _worker(
             report=reported.append,
-            extract=lambda p, m: (_ for _ in ()).throw(RuntimeError("bug")),
+            extract=lambda p, m, cid: (_ for _ in ()).throw(RuntimeError("bug")),
         )
         w._serve(self._apply(5))
         self.assertEqual([r.outcome for r in reported], ["failed_retryable"])
@@ -175,7 +186,7 @@ class RealResolveIdentityTest(unittest.TestCase):
         return Worker(
             Mailbox(),
             resolve=resolve_cover,   # the real resolver (dir-scan path)
-            extract=lambda p, m: extracted.append(p) or ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: extracted.append(p) or ("#1", "#2", "#3"),
             apply=lambda *c: None,
             revert=lambda: None,
             report=lambda r: None,
@@ -265,7 +276,7 @@ class WorkerCommitDedupTest(unittest.TestCase):
         # resolving to the same pair skips extraction and ctl.
         extracted, applied = [], []
         w, _ = _worker(
-            extract=lambda p, m: extracted.append((p, m)) or ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: extracted.append((p, m)) or ("#1", "#2", "#3"),
             apply=lambda *c: applied.append(c),
         )
         r1 = w._run_once(self._apply(5))

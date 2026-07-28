@@ -193,7 +193,8 @@ class Worker:
             return Result(gen, SKIPPED_DUPLICATE, str(resolution.path))
         if self._mailbox.superseded(gen):
             return None  # a newer desire is waiting; drop before extract + ctl
-        c1, c2, c3 = self._extract(resolution.path, desired.mode)
+        c1, c2, c3 = self._extract(resolution.path, desired.mode,
+                                   resolution.content_id)
         if self._mailbox.superseded(gen):
             return None  # re-check immediately before ctl: extract is not free,
             #              so a newer desire may have arrived during it (guarantee b)

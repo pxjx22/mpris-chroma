@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from .apply import CtlError, apply_wlchroma, revert_wlchroma
-from .colors import extract_colors
+from .colors import PaletteMemo
 from .coordinator import Coordinator, mode_from_color_scheme
 from .cover import resolve_cover
 from .framing import READ_CHUNK, LineFramer
@@ -215,7 +215,7 @@ def main():
     worker = Worker(
         mailbox,
         resolve=lambda art, cd: resolve_cover(art, cd, should_stop=stopping.is_set),
-        extract=extract_colors,
+        extract=PaletteMemo(),
         apply=apply_wlchroma,
         revert=revert_wlchroma,
         report=_post,

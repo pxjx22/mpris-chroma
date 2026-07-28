@@ -39,7 +39,7 @@ class HeartbeatTest(unittest.TestCase):
         worker = Worker(
             mb,
             resolve=slow_resolve,
-            extract=lambda p, m: ("#1", "#2", "#3"),
+            extract=lambda p, m, cid: ("#1", "#2", "#3"),
             apply=lambda *c: None,
             revert=lambda: None,
             report=lambda r: reported.set(),
