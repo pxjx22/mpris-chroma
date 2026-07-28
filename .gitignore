@@ -4,6 +4,10 @@ __pycache__/
 # User-generated A/B verdict data from tools/palette_lab.py, not source.
 tools/verdicts.json
 
+# Subagent-driven-development scratch: ledgers, task briefs, review packages.
+# Per-plan working state, not source — the git history is the durable record.
+.superpowers/
+
 # Claude Code worktrees. Local-only checkouts of this same repo — committing
 # them would nest the tree inside itself, and leaving them untracked lets a
 # `git add -A` in one session sweep another session's worktree into its commit.

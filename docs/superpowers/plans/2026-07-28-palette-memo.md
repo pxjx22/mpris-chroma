@@ -352,6 +352,20 @@ second import statement mid-file — then append:
 DEFAULT_ACCENT = "#a48ec7"
 
 
+def _counting_select(calls, boom):
+    """A select fake that records every call and can be armed to raise.
+
+    Shared by both exception tests: they differ in what they assert after the
+    failure, not in how the failure is produced.
+    """
+    def select(p):
+        calls.append(p)
+        if boom["on"]:
+            raise MemoryError("decode blew up")
+        return ([(0.5, 0.1, 1.0)], len(calls))
+    return select
+
+
 class PaletteMemoFailureTest(unittest.TestCase):
     def test_an_unextractable_cover_is_cached_as_the_default(self):
         # Caching the failure is deliberate: it turns the "no extractable
@@ -374,16 +388,8 @@ class PaletteMemoExceptionSafetyTest(unittest.TestCase):
         # assigned before the value, a select that raises would leave the slot
         # claiming the NEW key while holding the OLD picks, and the retry below
         # would be served the previous cover's palette without re-selecting.
-        calls = []
-        boom = {"on": False}
-
-        def select(p):
-            calls.append(p)
-            if boom["on"]:
-                raise MemoryError("decode blew up")
-            return ([(0.5, 0.1, 1.0)], len(calls))
-
-        memo = _memo(select=select,
+        calls, boom = [], {"on": False}
+        memo = _memo(select=_counting_select(calls, boom),
                      render=lambda picks, n, mode, label="?": (str(n),) * 3)
         memo(Path("/a.jpg"), "dark", (10, 100))           # slot holds A
         boom["on"] = True
@@ -398,16 +404,8 @@ class PaletteMemoExceptionSafetyTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
     def test_the_slot_still_serves_the_old_cover_after_a_failure(self):
-        calls = []
-        boom = {"on": False}
-
-        def select(p):
-            calls.append(p)
-            if boom["on"]:
-                raise MemoryError("decode blew up")
-            return ([(0.5, 0.1, 1.0)], len(calls))
-
-        memo = _memo(select=select,
+        calls, boom = [], {"on": False}
+        memo = _memo(select=_counting_select(calls, boom),
                      render=lambda picks, n, mode, label="?": (str(n),) * 3)
         first = memo(Path("/a.jpg"), "dark", (10, 100))
         boom["on"] = True
