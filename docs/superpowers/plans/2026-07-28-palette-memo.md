@@ -340,7 +340,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `PaletteMemo` from Task 2, `render_palette` from Task 1.
-- Produces: nothing new. This task adds only tests — the implementation from Task 2 should already satisfy them. **If either test passes on the first run, stop and check why**; the exception test in particular is written to fail against the wrong assignment order.
+- Produces: nothing new. This task adds only tests, and Task 2's implementation should already satisfy them — so unlike every other task here, the tests are **expected to pass on the first run**. That is exactly why Step 3's mutation check is mandatory and not optional: a test that guards an ordering constraint passes trivially against correct code, and without deliberately breaking the order you have no evidence it guards anything at all.
 
 - [ ] **Step 1: Write the failing tests**
 
