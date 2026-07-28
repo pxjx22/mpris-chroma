@@ -109,6 +109,34 @@ comment ("extract is not free, so a newer desire may have arrived during it")
 becomes conservative rather than wrong on a memo hit, and the check must stay —
 it still guards the miss path, which is unchanged at ~6 ms.
 
+### Cases the memo covers beyond a theme flip
+
+The justification above (~5 ms twice a day, off the main loop) undersells this
+work — it invites the conclusion that the complexity wasn't warranted. Traced
+against the code by the final reviewer, the frequent case is not the theme
+flip at all:
+
+- **Pause/resume of the same track.** `decide()` returns a revert whenever no
+  player is Playing (`select.py:38-39`). A committed revert sets
+  `self._last_committed = (None, mode)` (`worker.py:180`), which does not carry
+  `content_id`. So resuming the *same* track misses the worker's
+  `(content_id, mode)` dedup entirely and — before this branch — re-decoded the
+  cover from scratch. This happens many times per listening session, not
+  twice a day.
+- **A player closing and reopening on the same track.** Same mechanism: the
+  close is a revert (`_last_committed = (None, mode)`), and reopening on the
+  same cover misses dedup the same way.
+- **Each of up to three retries after a failed `wlchroma-ctl` call.**
+  `_last_committed` is deliberately *not* updated on `CtlError`
+  (`worker.py:203-205`), so a retry re-enters `_run_once` with the same
+  `content_id`; the worker's own dedup can't help there by design, but the
+  memo slot was already populated by the failed attempt, so the retry is a
+  memo hit rather than a re-decode.
+
+These three — not theme flips — are the memo's frequent case. The theme-flip
+number in the problem statement above is real but is the rare case this design
+also happens to cover.
+
 ## 5. Invariants
 
 1. **Assignment order.** `self._value = select_palette(path)` executes *before*

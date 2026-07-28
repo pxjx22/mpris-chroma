@@ -234,6 +234,23 @@ class SplitPipelineTest(unittest.TestCase):
                 self.assertEqual(colors.render_palette(picks, n, mode),
                                  extract_colors(img, mode))
 
+    def test_the_default_wiring_matches_uncached_extract(self):
+        # PaletteMemo's production defaults, with nothing injected -- the path
+        # sync.py actually ships. Every test in test_palette_memo.py injects
+        # both halves, and the corpus equivalence test is presence-gated, so
+        # without this the shipped wiring is untested on a clean checkout.
+        # Reusing one memo across both modes also means the second render is
+        # handed the SAME picks list as the first, which pins that tone() does
+        # not mutate its input.
+        img = self.tmp / "w.png"
+        _thirds(img, "#d12b2b", "#2b7fd1", "#e0d020")
+        st = img.stat()
+        cid = (st.st_size, st.st_mtime_ns)
+        memo = colors.PaletteMemo()
+        for mode in ("dark", "light"):
+            with self.subTest(mode=mode):
+                self.assertEqual(memo(img, mode, cid), extract_colors(img, mode))
+
 
 class PipelineInvariantTest(unittest.TestCase):
     """Properties of the whole extract path that no single stage owns."""

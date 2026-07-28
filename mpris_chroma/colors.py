@@ -47,6 +47,14 @@ _MAX_DECODE_BYTES = 16 * 1024 * 1024  # 16 MiB; bounds local covers, which are
                                       # not size-capped by the download path
 _MAX_PIXELS = 16_000_000              # ~16 MP declared-dimension ceiling
 
+# Sentinel for PaletteMemo's empty slot (see PaletteMemo._key below). Plain
+# `None` would be ambiguous: if `content_id` were ever `None`, `None != None`
+# is `False`, so the empty slot would read as a hit and `self._value` would
+# unpack `None` with a confusing TypeError. `_UNSET` can never equal a real
+# content_id. Module-level but immutable, so the zero-mutable-state
+# constraint on this module still holds.
+_UNSET = object()
+
 
 def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]:
     """Return [(count, (h,s,v)), ...] for a quantized version of the image.
@@ -216,12 +224,26 @@ class PaletteMemo:
 
     Not thread-safe, and does not need to be: `extract` is called only from the
     single worker thread (worker.py `_serve`).
+
+    `content_id` now has two consumers that must change together if it is ever
+    strengthened: the worker's `(content_id, mode)` dedup (worker.py:191-193)
+    and this memo's slot key. This memo's aliasing exposure is slightly wider
+    than the worker's, though: the worker's key is reset by a committed revert
+    or a failed ctl call, but neither resets this slot, so it stays keyed on
+    the last extracted cover across both. Two covers that stat identical
+    `(size, mtime_ns)` would alias here as they would there; the probability is
+    negligible on ns-granularity filesystems.
     """
 
     def __init__(self, select=select_palette, render=render_palette):
+        # select and render bind their defaults at `def` time, so
+        # `mock.patch.object(colors, "select_palette")` after a PaletteMemo
+        # has already been constructed will NOT affect it — tests must inject
+        # a replacement through this constructor, not patch the module global.
         self._select = select
         self._render = render
-        self._key: tuple[int, int] | None = None
+        # _UNSET, not None: see the module-level sentinel comment above.
+        self._key: tuple[int, int] | object = _UNSET
         self._value: tuple[list[tuple[float, float, float]], int] | None = None
 
     def __call__(self, image_path: Path, mode: str,

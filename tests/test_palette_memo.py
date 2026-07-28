@@ -1,7 +1,8 @@
+import tempfile
 import unittest
 from pathlib import Path
 
-from mpris_chroma.colors import PaletteMemo, render_palette
+from mpris_chroma.colors import PaletteMemo, render_palette, select_palette
 
 
 def _memo(select=None, render=None):
@@ -25,7 +26,10 @@ class PaletteMemoHitTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_mode_is_applied_after_the_hit_not_stored(self):
-        # If mode leaked into the slot, the second call would return "dark".
+        # This guards that the RENDERED triple is not what's cached: mode is
+        # applied strictly after the hit. (If mode instead leaked into the
+        # KEY, the second call would simply miss, re-select, and still return
+        # "light" correctly -- that failure mode would not be caught here.)
         memo = _memo()
         cid = (10, 100)
         memo(Path("/c/a.jpg"), "dark", cid)
@@ -78,19 +82,33 @@ def _counting_select(calls, boom):
 
 
 class PaletteMemoFailureTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def test_an_unextractable_cover_is_cached_as_the_default(self):
         # Caching the failure is deliberate: it turns the "no extractable
         # colors" warning from once-per-flip into once-per-cover. Safe because
         # a rewritten file changes content_id and misses.
-        calls = []
-        memo = _memo(select=lambda p: calls.append(p) or ([], 0),
-                     render=render_palette)
-        cid = (10, 100)
-        self.assertEqual(memo(Path("/c/bad.jpg"), "dark", cid),
-                         (DEFAULT_ACCENT,) * 3)
-        self.assertEqual(memo(Path("/c/bad.jpg"), "light", cid),
-                         (DEFAULT_ACCENT,) * 3)
-        self.assertEqual(len(calls), 1)
+        #
+        # Uses the REAL select_palette/render_palette (nothing injected) so
+        # the real _log.warning call in select_palette actually runs --
+        # injecting a fake select, as every other test in this file does,
+        # would silently skip the "logged once" half of this claim.
+        bad = self.tmp / "bad.jpg"
+        bad.write_bytes(b"this is not an image")
+        cid = (bad.stat().st_size, bad.stat().st_mtime_ns)
+        memo = PaletteMemo()  # production defaults: real select_palette, real render_palette
+        with self.assertLogs("mpris_chroma.colors", level="WARNING") as cm:
+            self.assertEqual(memo(bad, "dark", cid), (DEFAULT_ACCENT,) * 3)
+            self.assertEqual(memo(bad, "light", cid), (DEFAULT_ACCENT,) * 3)
+        # Load-bearing: a second warning here would mean the failure was
+        # re-selected on the second flip instead of served from the cached
+        # slot -- i.e. that the failure was NOT actually cached.
+        self.assertEqual(len(cm.output), 1)
 
 
 class PaletteMemoExceptionSafetyTest(unittest.TestCase):

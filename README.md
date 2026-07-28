@@ -21,7 +21,8 @@ playerctl --follow (jellyfin-tui, spotify MPRIS)
 coordinator: decide(players) ──► desired palette (newest Playing wins)
         │   parses + schedules only — never blocks the GLib loop
         ▼
-worker thread ──► resolve_cover ──► extract_colors (Pillow, 3 prominent colors)
+worker thread ──► resolve_cover ──► PaletteMemo (Pillow, 3 prominent colors,
+        │                            memoized per cover identity)
         │   (bounded, coalesced to the newest cover; stale results rejected;
         │    transient fetch failures retried with capped backoff)
         └─► wlchroma: wlchroma-ctl set-colors <c1> <c2> <c3> <fade_ms>
