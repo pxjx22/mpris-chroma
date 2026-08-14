@@ -33,6 +33,11 @@ WORKER_STOP_TIMEOUT = 10
 # 0 = no preference, 1 = prefer dark, 2 = prefer light.
 APPEARANCE_NS = "org.freedesktop.appearance"
 SCHEME_KEY = "color-scheme"
+# SEC-010: the theme-change receiver is pinned to this bus name and object
+# path so a signal from any other session-bus peer is filtered by the bus
+# daemon before it reaches _on_setting_changed.
+PORTAL_BUS_NAME = "org.freedesktop.portal.Desktop"
+PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
 
 
 # Subprocess policy (PY-002). The daemon has exactly two kinds of subprocess:
@@ -117,6 +122,39 @@ def _submit_guarded(item, worker, mailbox, on_worker_dead) -> None:
         on_worker_dead()
         return
     mailbox.put(item)
+
+
+def _make_scheme_handler(on_scheme, log_drop):
+    """Build the portal SettingChanged callback (SEC-010). Sender/path pinning
+    is delivered by _register_scheme_receiver's add_signal_receiver kwargs, not
+    here — this validates the payload: only the appearance color-scheme key is
+    acted on, and a non-integer value is dropped (rate-limited via log_drop)
+    rather than raising, so one malformed signal cannot crash or disable the
+    receiver for later ones."""
+    def _on_setting_changed(namespace, key, value):
+        if str(namespace) != APPEARANCE_NS or str(key) != SCHEME_KEY:
+            return
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            log_drop("scheme", f"non-integer color-scheme value: {value!r}")
+            return
+        on_scheme(ivalue)
+
+    return _on_setting_changed
+
+
+def _register_scheme_receiver(bus, handler) -> None:
+    """Subscribe `handler` to the portal's SettingChanged signal, pinned to the
+    portal's bus name and object path (SEC-010) so the bus daemon filters out
+    a signal forged by any other session-bus peer before it is ever
+    dispatched."""
+    bus.add_signal_receiver(
+        handler,
+        signal_name="SettingChanged",
+        dbus_interface="org.freedesktop.portal.Settings",
+        bus_name=PORTAL_BUS_NAME,
+        path=PORTAL_OBJECT_PATH)
 
 
 def _bounded_revert() -> None:
@@ -261,14 +299,9 @@ def main():
             bus_name="org.freedesktop.DBus")
 
         if follow_scheme:
-            def _on_setting_changed(namespace, key, value):
-                if str(namespace) == APPEARANCE_NS and str(key) == SCHEME_KEY:
-                    coordinator.on_scheme(int(value))
-
-            bus.add_signal_receiver(
-                _on_setting_changed,
-                signal_name="SettingChanged",
-                dbus_interface="org.freedesktop.portal.Settings")
+            _register_scheme_receiver(
+                bus,
+                _make_scheme_handler(coordinator.on_scheme, coordinator.log_drop))
 
         def _on_term():
             # Sequenced shutdown (design §5): stop scheduling and invalidate

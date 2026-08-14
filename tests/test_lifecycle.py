@@ -78,6 +78,69 @@ class TerminateChildTest(unittest.TestCase):
         sync._terminate_child(p, timeout=1)  # must not raise
 
 
+class SchemeHandlerTest(unittest.TestCase):
+    """SEC-010: the portal SettingChanged callback validates namespace, key,
+    and value type before calling on_scheme, and never raises or disables
+    itself on malformed input — sender/path pinning is delivered separately by
+    _register_scheme_receiver's add_signal_receiver kwargs."""
+
+    def _handler(self):
+        calls, drops = [], []
+        handler = sync._make_scheme_handler(
+            on_scheme=calls.append,
+            log_drop=lambda category, detail: drops.append(category))
+        return handler, calls, drops
+
+    def test_accepts_a_valid_portal_signal(self):
+        handler, calls, drops = self._handler()
+        handler(sync.APPEARANCE_NS, sync.SCHEME_KEY, 2)
+        self.assertEqual(calls, [2])
+        self.assertEqual(drops, [])
+
+    def test_ignores_wrong_namespace_or_key(self):
+        handler, calls, drops = self._handler()
+        handler("org.gnome.desktop.interface", sync.SCHEME_KEY, 2)
+        handler(sync.APPEARANCE_NS, "accent-color", 2)
+        self.assertEqual(calls, [])
+
+    def test_ignores_malformed_value_without_raising(self):
+        handler, calls, drops = self._handler()
+        handler(sync.APPEARANCE_NS, sync.SCHEME_KEY, "not-an-int")  # must not raise
+        self.assertEqual(calls, [])
+        self.assertEqual(drops, ["scheme"])
+
+    def test_second_call_still_works_after_a_malformed_one(self):
+        # A malformed value must not disable the callback for subsequent signals.
+        handler, calls, drops = self._handler()
+        handler(sync.APPEARANCE_NS, sync.SCHEME_KEY, "bad")
+        handler(sync.APPEARANCE_NS, sync.SCHEME_KEY, 1)
+        self.assertEqual(calls, [1])
+
+
+class SchemeReceiverRegistrationTest(unittest.TestCase):
+    """SEC-010: the theme-change receiver is pinned to the portal's bus name
+    and object path, so a signal from any other session-bus peer is filtered
+    by the bus daemon before it ever reaches the handler."""
+
+    def test_registers_pinned_to_the_portal_bus_name_and_path(self):
+        seen = {}
+
+        def add_signal_receiver(handler, **kw):
+            seen["handler"] = handler
+            seen["kw"] = kw
+
+        bus = types.SimpleNamespace(add_signal_receiver=add_signal_receiver)
+        sentinel = object()
+        sync._register_scheme_receiver(bus, sentinel)
+
+        self.assertIs(seen["handler"], sentinel)
+        self.assertEqual(seen["kw"]["signal_name"], "SettingChanged")
+        self.assertEqual(seen["kw"]["dbus_interface"],
+                          "org.freedesktop.portal.Settings")
+        self.assertEqual(seen["kw"]["bus_name"], sync.PORTAL_BUS_NAME)
+        self.assertEqual(seen["kw"]["path"], sync.PORTAL_OBJECT_PATH)
+
+
 class SpawnFollowTest(unittest.TestCase):
     """PY-002: the playerctl watcher is spawned through one documented policy
     helper — an argv list (never shell=True) with stdout piped for the GLib
