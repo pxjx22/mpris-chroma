@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mpris-chroma"
 version = "0.1.0"
@@ -6,12 +10,26 @@ dependencies = [
     # GLib main loop + D-Bus: playerctl stdout drives track changes, while
     # D-Bus NameOwnerChanged drives reverts when a player process exits
     # (playerctl --follow emits no line for a vanished player).
-    "PyGObject",
+    # PyGObject>=3.52 requires the girepository-2.0 pkg-config module
+    # unconditionally (no fallback to 1.0), which isn't packaged for Ubuntu
+    # 24.04 LTS (libgirepository1.0-dev is the newest available there) — the
+    # CI matrix's `pip install .` is what caught this (PY-003); on this
+    # laptop the daemon uses the distro's python-gobject package, not pip, so
+    # this bound only constrains what `pip install .` resolves.
+    "PyGObject<3.52",
     "dbus-python",
     # In-process album-art decoding (JPEG/PNG/WebP). Replaces the ImageMagick
     # subprocess so cover bytes are never handed to an external delegate.
     "Pillow",
 ]
+
+# Without this, setuptools' flat-layout auto-discovery finds both
+# mpris_chroma/ and systemd/ (the unit-file directory) as candidate
+# top-level packages and refuses to guess (PY-003: caught by the first real
+# `pip install .`, since local dev never installs the package — pytest's
+# pythonpath below imports straight from the working directory).
+[tool.setuptools.packages.find]
+include = ["mpris_chroma*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
