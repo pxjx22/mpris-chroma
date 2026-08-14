@@ -162,6 +162,31 @@ class SpawnFollowTest(unittest.TestCase):
         self.assertEqual(seen["kw"].get("stdout"), subprocess.PIPE)
         self.assertNotIn("shell", seen["kw"])                  # never shell=True
 
+    def test_spawn_uses_the_resolved_playerctl_path_as_argv0(self):
+        # SEC-017: once playerctl is resolved to an absolute path at startup,
+        # that path is what actually gets spawned — not a bare name PATH
+        # could re-resolve differently later.
+        seen = {}
+        sync._spawn_follow(popen=lambda cmd, **kw: seen.setdefault("cmd", list(cmd)),
+                            playerctl="/usr/bin/playerctl")
+        self.assertEqual(seen["cmd"][0], "/usr/bin/playerctl")
+
+
+class ResolvePlayerctlTest(unittest.TestCase):
+    """SEC-017: playerctl is resolved to an absolute path once at startup and
+    verified present, rather than left as a bare name for Popen/PATH to
+    re-resolve at spawn time — a PATH manipulated after this check cannot
+    substitute a different binary."""
+
+    def test_returns_the_resolved_absolute_path(self):
+        path = sync._resolve_playerctl(which=lambda name: "/usr/bin/playerctl")
+        self.assertEqual(path, "/usr/bin/playerctl")
+
+    def test_missing_executable_raises_a_clear_error(self):
+        with self.assertRaises(sync.MissingExecutableError) as ctx:
+            sync._resolve_playerctl(which=lambda name: None)
+        self.assertIn("playerctl", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

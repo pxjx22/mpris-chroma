@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,12 +47,33 @@ PORTAL_OBJECT_PATH = "/org/freedesktop/portal/desktop"
 # _terminate_child. Both use argv lists; nothing uses shell=True.
 
 
-def _spawn_follow(*, popen=subprocess.Popen):
+class MissingExecutableError(RuntimeError):
+    """A required executable was not found on PATH at startup (SEC-017)."""
+
+
+def _resolve_playerctl(*, which=shutil.which) -> str:
+    """Resolve playerctl to an absolute path once, at startup, and verify it
+    exists (SEC-017). The resolved path is then passed explicitly as argv[0]
+    to Popen instead of a bare name, so a PATH manipulated after this check
+    cannot substitute a different binary at spawn time. A same-user attacker
+    who can already alter the service's PATH/environment has this daemon's
+    own privileges, so this closes a defense-in-depth gap, not a privilege
+    boundary — matching the finding's own severity/context framing."""
+    path = which("playerctl")
+    if path is None:
+        raise MissingExecutableError(
+            "playerctl not found on PATH — install it "
+            "(Arch: pacman -S playerctl)")
+    return path
+
+
+def _spawn_follow(*, popen=subprocess.Popen, playerctl="playerctl"):
     """Spawn the long-lived playerctl watcher (PY-002). Lifecycle policy: an
     argv list (never shell=True), stdout piped for the GLib IO watch, stderr
     inherited to the journal. It runs for the daemon's lifetime and is reaped by
-    _terminate_child within CHILD_STOP_TIMEOUT."""
-    return popen(_follow_cmd(), stdout=subprocess.PIPE)
+    _terminate_child within CHILD_STOP_TIMEOUT. `playerctl` is the resolved
+    absolute path from _resolve_playerctl (SEC-017), not a bare name."""
+    return popen(_follow_cmd(playerctl), stdout=subprocess.PIPE)
 
 
 def _terminate_child(proc, *, timeout: int = CHILD_STOP_TIMEOUT) -> None:
@@ -67,15 +89,17 @@ def _terminate_child(proc, *, timeout: int = CHILD_STOP_TIMEOUT) -> None:
         proc.wait()
 
 
-def _follow_cmd():
+def _follow_cmd(playerctl="playerctl"):
     """argv for the streaming multi-player playerctl watcher.
 
     -a emits a named event for every whitelisted player on any change (not just
     the 'current' one); the `metadata` subcommand is REQUIRED or playerctl prints
-    usage and exits.
+    usage and exits. `playerctl` is normally the absolute path resolved by
+    _resolve_playerctl (SEC-017); the bare-name default keeps this callable
+    standalone (e.g. from tests) without requiring that resolution step.
     """
     return [
-        "playerctl", f"--player={PLAYERS}", "-a", "--follow", "metadata",
+        playerctl, f"--player={PLAYERS}", "-a", "--follow", "metadata",
         "--format", "{{playerName}}\t{{status}}\t{{mpris:artUrl}}",
     ]
 
@@ -179,6 +203,15 @@ def main():
     # Surface contained worker/cover failures (SEC-015) in the journal.
     logging.basicConfig(level=logging.WARNING)
 
+    # Resolve and verify playerctl once, up front (SEC-017): fail loudly and
+    # immediately rather than spawning a bare name that PATH might resolve to
+    # something else, or that simply doesn't exist.
+    try:
+        playerctl_path = _resolve_playerctl()
+    except MissingExecutableError as e:
+        _log.critical("%s", e)
+        sys.exit(1)
+
     DBusGMainLoop(set_as_default=True)
     loop = GLib.MainLoop()
     bus = dbus.SessionBus()
@@ -264,7 +297,7 @@ def main():
     # Enter the guaranteed-cleanup scope immediately after a successful spawn: an
     # exception while wiring the IO watch or receivers below would otherwise leak
     # the playerctl child (SEC-013).
-    proc = _spawn_follow()
+    proc = _spawn_follow(playerctl=playerctl_path)
     stdout = proc.stdout        # never None: _spawn_follow always pipes stdout
     try:
         fd = stdout.fileno()
