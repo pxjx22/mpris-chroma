@@ -12,6 +12,12 @@ def _ready(path="/covers/a.jpg", content_id=(10, 100)):
     return Ready(Path(path), content_id)
 
 
+# A valid PNG *signature* (cover.py's dir-scan fallback sniffs the leading
+# bytes before considering a file a candidate) plus filler to vary size.
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+_PNG_LONGER = b"\x89PNG\r\n\x1a\n" + b"\x00" * 128
+
+
 def _worker(**overrides):
     """A Worker wired with inert fakes; individual tests override the stages
     they exercise. `post` runs the callback synchronously so adopt-style
@@ -196,12 +202,12 @@ class RealResolveIdentityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             covers = Path(d)
             img = covers / "cover.jpg"
-            img.write_bytes(b"ONE")
+            img.write_bytes(_PNG)
             extracted = []
             w = self._worker(extracted)
             desired = Desired(CoverTarget("", covers), "dark")
             r1 = w._run_once((1, desired))
-            img.write_bytes(b"TWO-LONGER")     # same path, new size+mtime
+            img.write_bytes(_PNG_LONGER)       # same path, new size+mtime
             os.utime(img, ns=(1, 1))           # force a distinct mtime_ns too
             r2 = w._run_once((2, desired))
         self.assertEqual(r1.outcome, "committed")
@@ -211,7 +217,7 @@ class RealResolveIdentityTest(unittest.TestCase):
     def test_unchanged_file_is_skipped_duplicate(self):
         with tempfile.TemporaryDirectory() as d:
             covers = Path(d)
-            (covers / "cover.jpg").write_bytes(b"ONE")
+            (covers / "cover.jpg").write_bytes(_PNG)
             extracted = []
             w = self._worker(extracted)
             desired = Desired(CoverTarget("", covers), "dark")

@@ -73,13 +73,21 @@ class ResolveCoverTest(unittest.TestCase):
         img.write_bytes(b"x")
         self.assertEqual(resolve_cover(f"file://{img}", covers).path, img.resolve())
 
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        cover._dir_fallback_cache.clear()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
     def test_remote_url_falls_back_to_newest_cover(self):
         covers = self.tmp / "covers"
         covers.mkdir()
         old = covers / "old.jpeg"
-        old.write_bytes(b"x")
+        old.write_bytes(_PNG)
         new = covers / "new.jpeg"
-        new.write_bytes(b"x")
+        new.write_bytes(_PNG)
         os.utime(old, (1, 1))
         os.utime(new, (time.time(), time.time()))
         self.assertEqual(
@@ -93,6 +101,98 @@ class ResolveCoverTest(unittest.TestCase):
 
     def test_missing_covers_dir_is_retryable(self):
         self.assertIsInstance(resolve_cover("", self.tmp / "nope"), cover.Retryable)
+
+
+class CoverDirFallbackHardeningTest(unittest.TestCase):
+    """SEC-012: the newest-file-in-covers fallback tolerates permission/IO
+    errors and per-file races, excludes symlinks and non-image files, and
+    never crashes the daemon; PERF-003: an unchanged directory is not
+    re-enumerated and re-stat'd on every event."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.covers = self.tmp / "covers"
+        self.covers.mkdir()
+        cover._dir_fallback_cache.clear()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_permission_error_enumerating_dir_is_retryable(self):
+        with mock.patch.object(cover.os, "scandir", side_effect=PermissionError):
+            r = resolve_cover("", self.covers)
+        self.assertIsInstance(r, cover.Retryable)
+
+    def test_a_candidate_vanishing_mid_scan_is_ignored(self):
+        # "vanished" is simulated as a stat() failure on that one entry — the
+        # scan must skip it and still pick the remaining valid candidate,
+        # rather than letting the OSError propagate and crash the daemon.
+        vanished = self.covers / "vanished.jpeg"
+        vanished.write_bytes(_PNG)
+        os.utime(vanished, (100, 100))  # newest by mtime, if it were readable
+        survivor = self.covers / "survivor.jpeg"
+        survivor.write_bytes(_PNG)
+        os.utime(survivor, (1, 1))
+
+        real_scandir = cover.os.scandir
+
+        def flaky_scandir(path):
+            for entry in real_scandir(path):
+                if entry.name == "vanished.jpeg":
+                    entry = mock.Mock(wraps=entry)
+                    entry.stat.side_effect = FileNotFoundError
+                yield entry
+
+        with mock.patch.object(cover.os, "scandir", side_effect=flaky_scandir):
+            r = resolve_cover("", self.covers)
+        self.assertEqual(r.path, survivor)
+
+    def test_newer_non_image_file_does_not_replace_valid_cover(self):
+        junk = self.covers / "cover.nfo"
+        junk.write_bytes(b"not an image, just metadata text")
+        os.utime(junk, (100, 100))
+        real = self.covers / "art.jpeg"
+        real.write_bytes(_PNG)
+        os.utime(real, (1, 1))
+        r = resolve_cover("", self.covers)
+        self.assertEqual(r.path, real)
+
+    def test_symlinked_cover_is_never_selected(self):
+        target = self.tmp / "outside.jpeg"
+        target.write_bytes(_PNG)
+        link = self.covers / "link.jpeg"
+        link.symlink_to(target)
+        r = resolve_cover("", self.covers)
+        self.assertIsInstance(r, cover.Retryable)  # no other candidate
+
+    def test_all_candidates_invalid_is_retryable_not_a_crash(self):
+        (self.covers / "readme.txt").write_bytes(b"not an image")
+        r = resolve_cover("", self.covers)
+        self.assertIsInstance(r, cover.Retryable)
+
+    def test_unchanged_directory_is_not_rescanned(self):
+        art = self.covers / "art.jpeg"
+        art.write_bytes(_PNG)
+        resolve_cover("", self.covers)  # populates the memo
+
+        with mock.patch.object(
+                cover.os, "scandir", wraps=cover.os.scandir) as scandir:
+            r = resolve_cover("", self.covers)
+        scandir.assert_not_called()
+        self.assertEqual(r.path, art)
+
+    def test_a_new_file_invalidates_the_memo(self):
+        old = self.covers / "old.jpeg"
+        old.write_bytes(_PNG)
+        os.utime(old, (1, 1))
+        resolve_cover("", self.covers)  # populates the memo on "old"
+
+        new = self.covers / "new.jpeg"
+        new.write_bytes(_PNG)
+        os.utime(new, (time.time(), time.time()))
+        r = resolve_cover("", self.covers)  # directory mtime changed -> rescans
+        self.assertEqual(r.path, new)
 
 
 class HttpCoverTest(unittest.TestCase):

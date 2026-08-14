@@ -330,6 +330,69 @@ def _resolve_local_cover(art_url: str, root: Path | None) -> Resolution:
     return Ready(target, _content_id(target))
 
 
+# PERF-003: memoize the fallback scan per covers_dir, keyed by the directory's
+# own mtime. Jellyfin covers are content-hash-named (a new cover is always a
+# new file, never an in-place overwrite of an existing name), so any change
+# that matters bumps the directory's mtime and invalidates the memo; a
+# quiescent directory is not re-enumerated, re-stat'd, and re-sniffed on
+# every event.
+_dir_fallback_cache: dict[Path, tuple[float, Path]] = {}
+
+
+def _newest_valid_cover(covers_dir: Path) -> Path | None:
+    """One pass over covers_dir (SEC-012): symlinks are never followed, a
+    candidate is stat'd once, a candidate that errors (permission denied,
+    vanished mid-scan) is skipped rather than raised, and only files whose
+    leading bytes match an accepted image signature are considered — so a
+    stray non-image file (a sidecar .nfo, a partial write) cannot shadow the
+    real newest cover. Returns the newest validated candidate, or None."""
+    best: tuple[float, Path] | None = None
+    for entry in os.scandir(covers_dir):
+        try:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                continue
+            st = entry.stat(follow_symlinks=False)
+            with open(entry.path, "rb") as f:
+                header = f.read(12)
+        except OSError:
+            continue  # vanished, permission denied, or otherwise unreadable
+        if not _looks_like_image(header):
+            continue
+        if best is None or st.st_mtime > best[0]:
+            best = (st.st_mtime, Path(entry.path))
+    return best[1] if best else None
+
+
+def _scan_covers_dir(covers_dir: Path) -> Resolution:
+    """Newest validated image in covers_dir, memoized (SEC-012, PERF-003).
+    Permission and other filesystem errors enumerating the directory are
+    contained as Retryable rather than propagating and crashing the daemon."""
+    try:
+        dir_mtime = covers_dir.stat().st_mtime
+    except OSError:
+        _dir_fallback_cache.pop(covers_dir, None)
+        return Retryable("covers dir missing")
+
+    cached = _dir_fallback_cache.get(covers_dir)
+    if cached is not None and cached[0] == dir_mtime:
+        _, path = cached
+        try:
+            return Ready(path, _content_id(path))
+        except OSError:
+            _dir_fallback_cache.pop(covers_dir, None)  # cached file vanished
+
+    try:
+        newest = _newest_valid_cover(covers_dir)
+    except OSError:
+        _dir_fallback_cache.pop(covers_dir, None)
+        return Retryable("covers dir unreadable")
+    if newest is None:
+        _dir_fallback_cache.pop(covers_dir, None)
+        return Retryable("no cover in dir yet")  # write may lag the metadata line
+    _dir_fallback_cache[covers_dir] = (dir_mtime, newest)
+    return Ready(newest, _content_id(newest))
+
+
 def resolve_cover(art_url: str, covers_dir: Path | None = None, *,
                   should_stop=None) -> Resolution:
     """Resolve the current album cover to a typed Resolution (4c, SEC-018).
@@ -376,12 +439,5 @@ def resolve_cover(art_url: str, covers_dir: Path | None = None, *,
         return Ready(dest, _content_id(dest))
 
     if covers_dir is not None:
-        try:
-            files = [f for f in covers_dir.iterdir() if f.is_file()]
-        except (FileNotFoundError, NotADirectoryError):
-            return Retryable("covers dir missing")  # may appear once the player writes
-        if files:
-            newest = max(files, key=lambda f: f.stat().st_mtime)
-            return Ready(newest, _content_id(newest))
-        return Retryable("no cover in dir yet")  # write may lag the metadata line
+        return _scan_covers_dir(covers_dir)
     return Rejected("no art source")
