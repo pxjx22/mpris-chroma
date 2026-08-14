@@ -13,5 +13,24 @@ WorkingDirectory=%h/mpris-chroma
 Restart=on-failure
 RestartSec=3
 
+# SEC-014: sandbox the process. Only ~/.cache/mpris-chroma is writable; the
+# repo, wlchroma binary/config, and Jellyfin covers are read under
+# ProtectHome=read-only. AF_UNIX covers the D-Bus session bus and the
+# wlchroma-ctl socket (%t/wlchroma.sock); AF_INET(6) covers Spotify CDN HTTPS.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/mpris-chroma
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+UMask=0077
+MemoryMax=256M
+TasksMax=32
+TimeoutStopSec=30
+
 [Install]
 WantedBy=graphical-session.target
