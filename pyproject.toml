@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mpris-chroma"
 version = "0.1.0"
@@ -12,6 +16,14 @@ dependencies = [
     # subprocess so cover bytes are never handed to an external delegate.
     "Pillow",
 ]
+
+# Without this, setuptools' flat-layout auto-discovery finds both
+# mpris_chroma/ and systemd/ (the unit-file directory) as candidate
+# top-level packages and refuses to guess (PY-003: caught by the first real
+# `pip install .`, since local dev never installs the package — pytest's
+# pythonpath below imports straight from the working directory).
+[tool.setuptools.packages.find]
+include = ["mpris_chroma*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
