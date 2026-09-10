@@ -78,6 +78,10 @@ def _histogram(image_path: Path) -> list[tuple[int, tuple[float, float, float]]]
                 return []
             if img.width * img.height > _MAX_PIXELS:
                 return []
+            # Ask the JPEG decoder to scale down to ~the sample size during
+            # decode; a pre-decode hint and a no-op for PNG/WebP, so neither
+            # the gate order above nor the decode surface changes.
+            img.draft("RGB", _SAMPLE)
             sample = img.convert("RGB").resize(_SAMPLE)
     except (OSError, UnidentifiedImageError, Image.DecompressionBombError):
         return []
