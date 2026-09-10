@@ -141,13 +141,19 @@ def _select(hist: list[tuple[int, tuple[float, float, float]]]
     ranked = sorted(hist, key=lambda e: _vibrancy_score(e[0], total, e[1]),
                     reverse=True)
     picked: list[tuple[float, float, float]] = []
+    labs: list[tuple[float, float, float]] = []
     for _, hsv in ranked:
         if len(picked) == 3:
             break
         lch = oklab.to_lch(*oklab.srgb_to_oklab(*colorsys.hsv_to_rgb(*hsv)))
-        if all(oklab.delta_e(oklab.from_lch(*lch), oklab.from_lch(*p))
-               >= SELECT_MIN_DE for p in picked):
+        # Each Lab is computed exactly once: the candidate's here, and each
+        # pick's when it is appended — not rebuilt per comparison inside the
+        # dedup loop (PERFORMANCE_AUDIT L-2).
+        lab = oklab.from_lch(*lch)
+        if all(oklab.delta_e(lab, picked_lab) >= SELECT_MIN_DE
+               for picked_lab in labs):
             picked.append(lch)
+            labs.append(lab)
     n_distinct = len(picked)
     # Repeat the last real color rather than fabricate a hue that isn't there.
     while len(picked) < 3:
