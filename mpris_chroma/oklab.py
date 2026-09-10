@@ -12,12 +12,14 @@ Hue is in radians throughout. sRGB channels are 0-1, not 0-255.
 import functools
 import math
 
-# The forward transform's cube roots are taken of non-negative linear-light
-# values for real colors, but bisection in max_chroma probes outside the gamut
-# where they can go slightly negative; copysign keeps that a real number instead
-# of a domain error.
+# The forward transform's cube roots are taken of linear-light values that are
+# non-negative for real colors, but bisection in max_chroma probes outside the
+# gamut where they can go slightly negative. math.cbrt is a real odd root for
+# negative inputs, so it replaces the copysign form while staying within 1 ulp
+# of it (max deviation 6.5e-16 over a 16-point probe set incl. negatives/zero,
+# PERFORMANCE_AUDIT L-1) at roughly half the per-call cost.
 def _cbrt(x: float) -> float:
-    return math.copysign(abs(x) ** (1 / 3), x)
+    return math.cbrt(x)
 
 
 def _to_linear(c: float) -> float:
