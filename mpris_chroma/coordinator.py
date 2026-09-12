@@ -81,10 +81,11 @@ class CoverState:
 
 
 def mode_from_color_scheme(value: int) -> Mode:
-    """Map the portal's color-scheme value to a palette mode. Anything that is
-    not an explicit light preference (incl. 0 = no preference and future values)
-    falls back to dark — the historical band."""
-    return "light" if value == 2 else "dark"
+    """Map freedesktop setting 0/1/2 -> Mode. Only 1 is explicitly dark; 0
+    (default) and 2 (light) and any unknown value fall back to light so
+    default-light desktops aren't inverted."""
+    # SEC-010: strict value mapping, fallback handles future enums safely
+    return "dark" if value == 1 else "light"
 
 
 def player_name_from_bus(bus_name: str) -> str | None:
