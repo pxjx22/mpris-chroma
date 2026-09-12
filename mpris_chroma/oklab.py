@@ -55,7 +55,8 @@ def in_gamut(L: float, a: float, b: float) -> bool:
     """True iff the color is representable in sRGB. The epsilon (1e-7) is
     empirical and prevents bisection from wandering at lightness extremes.
     Loosening toward 1e-4 regresses test_max_chroma_vanishes_at_the_extremes."""
-    return all(-1e-7 <= c <= 1 + 1e-7 for c in _to_linear_rgb(L, a, b))
+    r, g, b_linear = _to_linear_rgb(L, a, b)
+    return -1e-7 <= r <= 1 + 1e-7 and -1e-7 <= g <= 1 + 1e-7 and -1e-7 <= b_linear <= 1 + 1e-7
 
 
 def oklab_to_srgb(L: float, a: float, b: float) -> tuple[float, float, float]:
