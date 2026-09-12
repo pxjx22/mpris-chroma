@@ -128,6 +128,68 @@ def _closest_pair(slots: list[Toned]) -> tuple[int, int, float]:
     return best
 
 
+def _attempt_move(work: list[Toned], idx: int, direction: float,
+                  budget: list[float], rank: dict[int, int], order: list[int],
+                  lo: float, hi: float, n_distinct: int) -> bool:
+    """Attempt to move a slot by one step in the given direction.
+
+    Returns True if the slot was moved, False if blocked or budget exhausted.
+    """
+    step = min(SEPARATION_STEP, budget[idx])
+    if step <= 0.0:
+        return False
+
+    target = work[idx].L + direction * step
+
+    # Envelope first, then neighbours: clamping into [lo, hi] here
+    # means the neighbour clamp below only ever narrows further
+    # toward work[idx].L, never reopens room the envelope had just
+    # closed off. Applying it last (as this used to) let the
+    # neighbour clamp hand back a target the envelope had rejected,
+    # which could invert rank order and blow the budget in one move
+    # when the input already sat outside the envelope.
+    target = min(hi, max(lo, target))
+
+    # For input already outside the envelope, clamping alone is not
+    # enough: if work[idx].L is already past the bound on the side
+    # this move is heading further into, the clamp snaps `target`
+    # back across work[idx].L in the *opposite* direction from the
+    # one requested — e.g. a slot already above `hi` asked to move
+    # further up gets clamped down to `hi`, which is a downward
+    # move, not an upward one. That is not this slot's separation
+    # move; refuse it rather than apply it, or it can shove the
+    # slot straight through a neighbour it was never cleared
+    # against and invert rank order.
+    if (target - work[idx].L) * direction <= 0.0:
+        return False
+
+    pos = rank[idx]
+    if direction > 0 and pos + 1 < n_distinct:
+        target = min(target, work[order[pos + 1]].L)
+    if direction < 0 and pos - 1 >= 0:
+        target = max(target, work[order[pos - 1]].L)
+
+    delta = target - work[idx].L
+    if delta * direction <= 0.0:
+        return False
+
+    # Final cap at the slot's remaining budget. For in-envelope input
+    # this is a no-op (the clamps above already keep |delta| <= step
+    # <= budget[idx]), but for out-of-envelope input the envelope
+    # clamp above can jump `target` further than `step` allowed (e.g.
+    # snapping straight to `lo` from well below it) — the budget must
+    # still win that fight, or the displacement invariant breaks on
+    # exactly the input this routine is supposed to tame.
+    if abs(delta) > budget[idx]:
+        delta = budget[idx] if delta > 0 else -budget[idx]
+
+    target = work[idx].L + delta
+    delta = abs(delta)
+    budget[idx] -= delta
+    work[idx] = Toned(L=target, h=work[idx].h, c_src=work[idx].c_src)
+    return True
+
+
 def separate(slots: list[Toned], mode: str,
              n_distinct: int) -> tuple[list[Toned], SeparationResult]:
     """Push colliding slots apart in lightness only, within bounds (spec §6).
@@ -164,54 +226,10 @@ def separate(slots: list[Toned], mode: str,
             break
         # Move the higher-ranked slot of the pair up and the lower one down.
         up, down = (i, j) if rank[i] > rank[j] else (j, i)
-        moved = False
-        for idx, direction in ((up, +1.0), (down, -1.0)):
-            step = min(SEPARATION_STEP, budget[idx])
-            if step <= 0.0:
-                continue
-            target = work[idx].L + direction * step
-            # Envelope first, then neighbours: clamping into [lo, hi] here
-            # means the neighbour clamp below only ever narrows further
-            # toward work[idx].L, never reopens room the envelope had just
-            # closed off. Applying it last (as this used to) let the
-            # neighbour clamp hand back a target the envelope had rejected,
-            # which could invert rank order and blow the budget in one move
-            # when the input already sat outside the envelope.
-            target = min(hi, max(lo, target))
-            # For input already outside the envelope, clamping alone is not
-            # enough: if work[idx].L is already past the bound on the side
-            # this move is heading further into, the clamp snaps `target`
-            # back across work[idx].L in the *opposite* direction from the
-            # one requested — e.g. a slot already above `hi` asked to move
-            # further up gets clamped down to `hi`, which is a downward
-            # move, not an upward one. That is not this slot's separation
-            # move; refuse it rather than apply it, or it can shove the
-            # slot straight through a neighbour it was never cleared
-            # against and invert rank order.
-            if (target - work[idx].L) * direction <= 0.0:
-                continue
-            pos = rank[idx]
-            if direction > 0 and pos + 1 < n_distinct:
-                target = min(target, work[order[pos + 1]].L)
-            if direction < 0 and pos - 1 >= 0:
-                target = max(target, work[order[pos - 1]].L)
-            delta = target - work[idx].L
-            if delta * direction <= 0.0:
-                continue
-            # Final cap at the slot's remaining budget. For in-envelope input
-            # this is a no-op (the clamps above already keep |delta| <= step
-            # <= budget[idx]), but for out-of-envelope input the envelope
-            # clamp above can jump `target` further than `step` allowed (e.g.
-            # snapping straight to `lo` from well below it) — the budget must
-            # still win that fight, or the displacement invariant breaks on
-            # exactly the input this routine is supposed to tame.
-            if abs(delta) > budget[idx]:
-                delta = budget[idx] if delta > 0 else -budget[idx]
-            target = work[idx].L + delta
-            delta = abs(delta)
-            budget[idx] -= delta
-            work[idx] = Toned(L=target, h=work[idx].h, c_src=work[idx].c_src)
-            moved = True
+        moved_up = _attempt_move(work, up, +1.0, budget, rank, order, lo, hi, n_distinct)
+        moved_down = _attempt_move(work, down, -1.0, budget, rank, order, lo, hi, n_distinct)
+        moved = moved_up or moved_down
+
         # Check exhaustion before blockage so both stay reachable: a pass that
         # spends the last of every budget still counts as "moved", so without
         # this check first, budget exhaustion could hide behind next pass's
