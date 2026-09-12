@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .apply import CtlError
-from .cover import Ready, Rejected, Retryable
+from .cover import Rejected, Retryable
 from .state import Mode
 
 _log = logging.getLogger("mpris_chroma.worker")
