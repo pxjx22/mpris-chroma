@@ -186,6 +186,7 @@ class CoverDirFallbackHardeningTest(unittest.TestCase):
         old = self.covers / "old.jpeg"
         old.write_bytes(_PNG)
         os.utime(old, (1, 1))
+        time.sleep(0.01)
         resolve_cover("", self.covers)  # populates the memo on "old"
 
         new = self.covers / "new.jpeg"
