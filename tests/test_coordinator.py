@@ -60,11 +60,14 @@ class ColorSchemeMapTest(unittest.TestCase):
     def test_prefer_light_maps_to_light(self):
         self.assertEqual(mode_from_color_scheme(2), "light")
 
-    def test_no_preference_defaults_to_dark(self):
-        self.assertEqual(mode_from_color_scheme(0), "dark")
+    def test_no_preference_defaults_to_light(self):
+        self.assertEqual(mode_from_color_scheme(0), "light")
 
-    def test_unknown_value_defaults_to_dark(self):
-        self.assertEqual(mode_from_color_scheme(7), "dark")
+    def test_unknown_value_defaults_to_light(self):
+        self.assertEqual(mode_from_color_scheme(7), "light")
+
+    def test_negative_value_defaults_to_light(self):
+        self.assertEqual(mode_from_color_scheme(-1), "light")
 
 
 class OnLineTest(unittest.TestCase):
