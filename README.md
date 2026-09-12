@@ -61,7 +61,7 @@ python -m unittest discover -s tests -v
 ## Quickstart / Installation
 
 ### Prerequisites
-* Python 3.11+
+This repository prioritizes reliability and correctness through a comprehensive unittest suite. The test coverage validates pure logic states, thread coordination, cache eviction, and handles edge-case file mutations and adversarial bounds checks without requiring a live Wayland session.
 * Dependencies: `PyGObject`, `dbus-python`, `Pillow`
 * System packages (for Debian/Ubuntu): `python3-gi`, `python3-gi-cairo`, `python3-dbus`, `gir1.2-glib-2.0`, `libgirepository1.0-dev`, `libcairo2-dev`, `libdbus-1-dev`
 * `playerctl` and an active `wlchroma` instance running.
