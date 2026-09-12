@@ -24,6 +24,11 @@ def _solid(path: Path, hexcolor: str):
     Image.new("RGB", (64, 64), _rgb(hexcolor)).save(path)
 
 
+def _hex_to_lch(value: str) -> tuple[float, float, float]:
+    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return oklab.to_lch(*oklab.srgb_to_oklab(r, g, b))
+
+
 def _halves(path: Path, left: str, right: str):
     img = Image.new("RGB", (64, 64))
     img.paste(Image.new("RGB", (32, 64), _rgb(left)), (0, 0))
@@ -94,7 +99,7 @@ class ExtractTest(unittest.TestCase):
         img = self.tmp / "dark.png"
         _solid(img, "#3a0d0d")
         c1, _, _ = extract_colors(img)
-        L, C, _ = oklab.hex_to_lch(c1)
+        L, C, _ = _hex_to_lch(c1)
         lo, hi = ENVELOPES["dark"]
         self.assertGreaterEqual(L, lo - 1e-9)
         self.assertLessEqual(L, hi + 1e-9)
@@ -105,7 +110,7 @@ class ExtractTest(unittest.TestCase):
         img = self.tmp / "gray.png"
         _thirds(img, "#202020", "#808080", "#d0d0d0")
         for c in extract_colors(img):
-            self.assertLess(oklab.hex_to_lch(c)[1], NEUTRAL_C)
+            self.assertLess(_hex_to_lch(c)[1], NEUTRAL_C)
 
     def test_two_tone_cover_yields_distinct_hues(self):
         img = self.tmp / "two.png"
@@ -129,11 +134,11 @@ class ExtractTest(unittest.TestCase):
         dark = extract_colors(img, mode="dark")
         light = extract_colors(img, mode="light")
         for cd, cl in zip(dark, light):
-            self.assertAlmostEqual(oklab.hex_to_lch(cd)[2],
-                                   oklab.hex_to_lch(cl)[2], places=1)
+            self.assertAlmostEqual(_hex_to_lch(cd)[2],
+                                   _hex_to_lch(cl)[2], places=1)
         lo, _ = ENVELOPES["light"]
         for cl in light:
-            self.assertGreaterEqual(oklab.hex_to_lch(cl)[0], lo - 1e-9)
+            self.assertGreaterEqual(_hex_to_lch(cl)[0], lo - 1e-9)
 
     def test_small_vivid_accent_makes_the_palette(self):
         # The dominance failure mode: three drab regions own the pixel count,
@@ -193,7 +198,7 @@ class ModeIndependenceTest(unittest.TestCase):
         for src, cd, cl in zip(picks, dark, light):
             for out in (cd, cl):
                 with self.subTest(color=out):
-                    delta = abs(oklab.hex_to_lch(out)[2] - src[2])
+                    delta = abs(_hex_to_lch(out)[2] - src[2])
                     self.assertLess(delta, HUE_QUANTIZATION_TOLERANCE)
 
 
@@ -265,7 +270,7 @@ class PipelineInvariantTest(unittest.TestCase):
     def test_distinct_cover_yields_separated_slots(self):
         img = self.tmp / "d.png"
         _thirds(img, "#d1a973", "#b89265", "#9d7156")   # three tans: a collision
-        labs = [oklab.from_lch(*oklab.hex_to_lch(c)) for c in extract_colors(img)]
+        labs = [oklab.from_lch(*_hex_to_lch(c)) for c in extract_colors(img)]
         for i in range(3):
             for j in range(i + 1, 3):
                 with self.subTest(pair=(i, j)):
@@ -294,7 +299,7 @@ class PipelineInvariantTest(unittest.TestCase):
                     self.assertTrue(oklab.in_gamut(*s.to_lab()))
                     self.assertLess(
                         oklab.delta_e(s.to_lab(),
-                                      oklab.from_lch(*oklab.hex_to_lch(s.to_hex()))),
+                                      oklab.from_lch(*_hex_to_lch(s.to_hex()))),
                         0.005)
 
 
@@ -476,7 +481,7 @@ class ColorDataBoundsTest(unittest.TestCase):
 # Below this chroma, the hue angle is dominated by 8-bit output quantization
 # rather than by anything the pipeline did: quantization perturbs Oklab
 # (a, b) by roughly 0.002 — measured by perturbing random sRGB triples one
-# least-significant bit and converting through oklab.hex_to_lch: median 0.00127,
+# least-significant bit and converting through _hex_to_lch: median 0.00127,
 # p90 0.00169, so 0.002 is deliberately the conservative end — which produces
 # an angular error of about
 # atan(0.002 / C). For that error to stay inside this test's own 0.05 rad
@@ -557,8 +562,8 @@ class CorpusTest(unittest.TestCase):
         for cover, d, l in zip(self.covers, self.dark, self.light):
             for cd, cl in zip(d, l):
                 with self.subTest(cover=cover.name):
-                    _, Cd, hd = oklab.hex_to_lch(cd)
-                    _, Cl, hl = oklab.hex_to_lch(cl)
+                    _, Cd, hd = _hex_to_lch(cd)
+                    _, Cl, hl = _hex_to_lch(cl)
                     # A slot can be chromatic in one mode and near-grey in the
                     # other (toning moves lightness, which moves how much of
                     # the gamut-clamped chroma survives) — both sides must

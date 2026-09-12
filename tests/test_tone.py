@@ -6,7 +6,8 @@ from mpris_chroma.tone import ENVELOPES, GAMMA, NEUTRAL_C, Toned
 
 
 def _lch(hexc):
-    return oklab.hex_to_lch(hexc)
+    r, g, b = (int(hexc[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return oklab.to_lch(*oklab.srgb_to_oklab(r, g, b))
 
 
 class ChromaRuleTest(unittest.TestCase):

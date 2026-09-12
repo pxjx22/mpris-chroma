@@ -109,11 +109,6 @@ def delta_e(lab1: tuple[float, float, float],
     return math.dist(lab1, lab2)
 
 
-def hex_to_lch(value: str) -> tuple[float, float, float]:
-    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (1, 3, 5))
-    return to_lch(*srgb_to_oklab(r, g, b))
-
-
 def lch_to_hex(L: float, C: float, h: float) -> str:
     r, g, b = oklab_to_srgb(*from_lch(L, C, h))
     return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))

@@ -4,6 +4,11 @@ import unittest
 from mpris_chroma import oklab
 
 
+def _hex_to_lch(value: str) -> tuple[float, float, float]:
+    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return oklab.to_lch(*oklab.srgb_to_oklab(r, g, b))
+
+
 class RoundTripTest(unittest.TestCase):
     def test_srgb_oklab_round_trip(self):
         # Every channel combination must survive the forward+inverse transform;
@@ -25,7 +30,7 @@ class RoundTripTest(unittest.TestCase):
         # Quantization to 8 bits is the only permitted loss.
         for hexc in ("#000000", "#ffffff", "#e01050", "#0284c4"):
             with self.subTest(hexc=hexc):
-                self.assertEqual(oklab.lch_to_hex(*oklab.hex_to_lch(hexc)), hexc)
+                self.assertEqual(oklab.lch_to_hex(*_hex_to_lch(hexc)), hexc)
 
 
 class LightnessTest(unittest.TestCase):
@@ -36,14 +41,14 @@ class LightnessTest(unittest.TestCase):
     def test_lightness_is_perceptual_not_hsv_value(self):
         # The premise of the whole design: #d9d9d9 and #0284c4 share HSV value
         # ~0.8 but are nowhere near each other in apparent lightness.
-        grey = oklab.hex_to_lch("#d9d9d9")[0]
-        blue = oklab.hex_to_lch("#0284c4")[0]
+        grey = _hex_to_lch("#d9d9d9")[0]
+        blue = _hex_to_lch("#0284c4")[0]
         self.assertGreater(grey - blue, 0.2)
 
     def test_neutral_has_zero_chroma(self):
         for hexc in ("#000000", "#808080", "#ffffff"):
             with self.subTest(hexc=hexc):
-                self.assertLess(oklab.hex_to_lch(hexc)[1], 1e-6)
+                self.assertLess(_hex_to_lch(hexc)[1], 1e-6)
 
 
 class GamutTest(unittest.TestCase):
