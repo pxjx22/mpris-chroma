@@ -33,6 +33,11 @@ from mpris_chroma.apply import apply_wlchroma, revert_wlchroma, CtlError  # noqa
 from mpris_chroma.colors import _histogram, _select, _vibrancy_score  # noqa: E402
 from mpris_chroma import tone as tone_mod                  # noqa: E402
 
+
+def _hex_to_lch(value: str) -> tuple[float, float, float]:
+    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return oklab.to_lch(*oklab.srgb_to_oklab(r, g, b))
+
 CORPUS_DIRS = [Path.home() / ".local/share/jellyfin-tui/covers",
                Path.home() / ".cache/mpris-chroma/covers"]
 VERDICTS = Path(__file__).resolve().parent / "verdicts.json"
@@ -261,7 +266,7 @@ def _read_key() -> str:
 
 
 def _describe(colors_tuple, result) -> str:
-    lch = [oklab.hex_to_lch(c) for c in colors_tuple]
+    lch = [_hex_to_lch(c) for c in colors_tuple]
     line = "%s   L %s   lum %.3f" % (
         " ".join(colors_tuple),
         " ".join(".%02d" % round(l[0] * 100) for l in lch),
