@@ -97,7 +97,7 @@ def _config_palette(config_path: Path) -> tuple[str, str, str] | None:
     if not isinstance(palette, list) or len(palette) != 3:
         return None
     validated = tuple(_valid_hex(c) for c in palette)
-    if any(v is None for v in validated):
+    if None in validated:
         return None
     return validated  # type: ignore[return-value]
 
