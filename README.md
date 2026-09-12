@@ -19,7 +19,9 @@ flowchart TD
     end
 
     subgraph Output[IPC]
-        WL[wlchroma socket]
+        Coord[Coordinator<br/>GLib Main Loop]
+        Worker[Background Worker Thread<br/>Async Actor]
+        Memo[PaletteMemo<br/>Cache & Rate Limit]
     end
 
     PC -- Track/Status Updates --> Coord
