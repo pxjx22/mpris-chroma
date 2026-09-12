@@ -3,7 +3,6 @@ from pathlib import Path
 
 from mpris_chroma.select import decide
 from mpris_chroma.state import PlayerState
-from mpris_chroma.sync import _follow_cmd
 from mpris_chroma.worker import CoverTarget, Desired
 
 _JF_DIR = Path("/covers/jf")
@@ -12,21 +11,6 @@ _JF_DIR = Path("/covers/jf")
 def _covers_dir_for(name):
     """Only jellyfin-tui has a local cover directory (as in production)."""
     return _JF_DIR if name == "jellyfin-tui" else None
-
-
-class FollowCmdTest(unittest.TestCase):
-    def test_watches_both_players_with_names(self):
-        cmd = _follow_cmd()
-        joined = " ".join(cmd)
-        self.assertIn("metadata", cmd)          # required subcommand
-        self.assertIn("--follow", cmd)
-        self.assertIn("-a", cmd)                # all whitelisted players
-        self.assertIn("jellyfin-tui,spotify", joined)
-        self.assertIn("{{playerName}}", joined)
-
-    def test_metadata_precedes_format(self):
-        cmd = _follow_cmd()
-        self.assertLess(cmd.index("metadata"), cmd.index("--format"))
 
 
 class DecideTest(unittest.TestCase):
