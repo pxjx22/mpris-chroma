@@ -119,13 +119,26 @@ class SeparationResult:
 
 def _closest_pair(slots: list[Toned]) -> tuple[int, int, float]:
     labs = [s.to_lab() for s in slots]
-    best = (0, 1, float("inf"))
-    for i in range(len(slots)):
-        for j in range(i + 1, len(slots)):
-            d = oklab.delta_e(labs[i], labs[j])
-            if d < best[2]:
-                best = (i, j, d)
-    return best
+    n = len(labs)
+    delta_e = oklab.delta_e
+    if n == 3:
+        d01 = delta_e(labs[0], labs[1])
+        d02 = delta_e(labs[0], labs[2])
+        d12 = delta_e(labs[1], labs[2])
+        if d01 <= d02 and d01 <= d12:
+            return (0, 1, d01)
+        if d02 <= d12:
+            return (0, 2, d02)
+        return (1, 2, d12)
+
+    best_i, best_j, best_d = 0, 1, float("inf")
+    for i in range(n):
+        lab_i = labs[i]
+        for j in range(i + 1, n):
+            d = delta_e(lab_i, labs[j])
+            if d < best_d:
+                best_i, best_j, best_d = i, j, d
+    return best_i, best_j, best_d
 
 
 def separate(slots: list[Toned], mode: str,
