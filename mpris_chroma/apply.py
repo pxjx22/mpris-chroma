@@ -63,7 +63,7 @@ def apply_wlchroma(c1: str, c2: str, c3: str, *, fade_ms: int = FADE_MS,
     # whitespace or a newline could otherwise smuggle an extra IPC token or a
     # whole extra protocol line. Callers already validate (config via SEC-008,
     # extracted colors are formatted hex), so this only ever rejects a bug.
-    if any(_valid_hex(c) is None for c in (c1, c2, c3)):
+    if _valid_hex(c1) is None or _valid_hex(c2) is None or _valid_hex(c3) is None:
         raise CtlError(f"refusing to apply malformed palette: {(c1, c2, c3)!r}")
     cmd = [ctl, "set-colors", c1, c2, c3]
     if fade_ms > 0:
