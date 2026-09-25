@@ -54,7 +54,7 @@ depend on every sample byte.
 | 4 | `coordinator.py` | `coordinator` | done (all `test_coordinator` cases) |
 | 5 | `worker.py` | `worker` | done (`test_worker`, `test_mailbox`, `test_worker_integration`; the real-resolver identity cases move with step 7) |
 | 6 | `apply.py` | `apply` | done (all `test_apply` cases, plus real-process runner tests) |
-| 7 | `cover.py` | `cover::{fetch, cache, local}` | `Resolution`, `content_id` only |
+| 7 | `cover.py` | `cover::{policy, fetch, cache, local}` | done (all `test_cover` cases bar one, plus the two real-resolver worker cases) |
 | 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
 | 9 | integration tests | `tests/*.rs` against `tools/fake_mpris.py` | |
 
@@ -92,6 +92,44 @@ depend on every sample byte.
   stderr, Python's `communicate()` waits out the timeout and reports a
   timeout error, while the port reports ctl's real exit status (stderr is
   awaited only until the same deadline).
+
+### Cover resolution
+
+Security-relevant differences, each deliberate:
+
+- **DNS pinning.** The Python checks a host's resolved addresses, then lets
+  urllib resolve it again to connect, so a DNS-rebinding server can answer
+  the check with a public address and the connect with 127.0.0.1. Here
+  `policy::check_destination` returns the addresses it checked and the
+  transport connects only to those (a custom ureq resolver), on every hop,
+  redirects included. TLS is still verified against the URL's hostname.
+- **Bounded DNS.** `getaddrinfo` has no timeout; the lookup runs on a helper
+  thread and is abandoned after 5 s. The Python lookup is unbounded.
+- **Stricter "global address".** A superset of Python's `ipaddress`
+  refusals: every IANA special-purpose IPv4 block, and for IPv6 only global
+  unicast 2000::/3 minus protocol-assignment, documentation and 6to4 blocks.
+  IPv4-mapped and NAT64 addresses are refused outright.
+- **No proxies.** ureq reads `*_proxy` from the environment by default,
+  which would bypass pinning; it is disabled. (urllib honours those
+  variables; the systemd unit sets none.)
+- **Trust roots** are bundled Mozilla roots (webpki-roots) rather than the
+  system store.
+- **Stalled reads.** The body is still read in 64 KiB chunks under the byte
+  cap and the 20 s total deadline, with the stop flag polled per chunk, but a
+  single stalled read is bounded by the 20 s body timeout rather than
+  urllib's 5 s per-socket-operation timeout.
+- **URLs** are parsed per WHATWG (`url` crate), not `urlparse`: hosts are
+  lowercased, `file://localhost/` normalizes to an empty host, dot segments
+  are resolved before confinement (which still checks the canonical path).
+
+Test-harness differences: the Python mocks `os.scandir`/`os.replace`; here
+an unreadable covers dir is a covers "dir" that is a file, a failed publish
+renames onto a non-empty directory, and the scan memo is proven by putting
+the directory's mtime back after adding a newer cover. The Python's
+"candidate vanishes mid-scan" case is not reproduced (it needs a mocked
+`stat`); per-candidate errors are skipped structurally (`local::candidate`
+returns `None` on any error). The Python module globals (`CACHE_DIR`, the
+scan memo, the log limiter) are fields of `CoverResolver`.
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
 - JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
