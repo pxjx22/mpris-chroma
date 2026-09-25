@@ -5,16 +5,15 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# Assumes the repo is cloned at ~/mpris-chroma and wlchroma at ~/wlchroma
-# (siblings). Adjust these paths if your layout differs.
+# install.sh puts the binary in ~/.local/bin. Assumes wlchroma is cloned at
+# ~/wlchroma; adjust WLCHROMA_CTL if your layout differs.
 Environment=WLCHROMA_CTL=%h/wlchroma/zig-out/bin/wlchroma-ctl
-ExecStart=python -m mpris_chroma.sync
-WorkingDirectory=%h/mpris-chroma
+ExecStart=%h/.local/bin/mpris-chroma
 Restart=on-failure
 RestartSec=3
 
 # SEC-014: sandbox the process. Only ~/.cache/mpris-chroma is writable; the
-# repo, wlchroma binary/config, and Jellyfin covers are read under
+# binary, wlchroma binary/config, and Jellyfin covers are read under
 # ProtectHome=read-only. AF_UNIX covers the D-Bus session bus and the
 # wlchroma-ctl socket (%t/wlchroma.sock); AF_INET(6) covers Spotify CDN HTTPS.
 NoNewPrivileges=yes
