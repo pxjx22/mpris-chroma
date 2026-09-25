@@ -8,8 +8,10 @@ publish = false
 # Dependencies are added as the modules that need them are ported (see
 # README.md for the order), so nothing here is compiled before it is used.
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 log = "0.4"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
