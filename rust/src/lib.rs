@@ -6,8 +6,10 @@
 //! is observable (hex output), checked against golden fixtures generated from
 //! the Python code by `tools/dump_golden.py`.
 
+pub mod apply;
 pub mod color;
 pub mod coordinator;
+pub mod cover;
 pub mod framing;
 pub mod select;
 pub mod state;

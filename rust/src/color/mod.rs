@@ -34,9 +34,7 @@ pub const QUANTIZE_COLORS: usize = 16;
 /// Source picks as OkLCh, plus how many of them are real (the rest repeat).
 pub type Picks = (Vec<Lch>, usize);
 
-/// A cover's content identity: `(size, mtime_ns)`, as cover resolution
-/// derives it (SEC-018).
-pub type ContentId = (u64, i128);
+pub use crate::cover::ContentId;
 
 fn label(path: &Path) -> String {
     path.file_name().map_or_else(

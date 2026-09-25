@@ -52,9 +52,9 @@ depend on every sample byte.
 | 2 | `colors.py` decode / quantize / select, `PaletteMemo` | `color::{decode, resize, quantize, pick}`, `color::{select_palette, extract_colors, PaletteMemo}` | done, golden-checked |
 | 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | done (`test_decide`'s `_follow_cmd` cases move with step 8) |
 | 4 | `coordinator.py` | `coordinator` | done (all `test_coordinator` cases) |
-| 5 | `worker.py` | `worker` | job/result types only (`Desired`, `JobResult`, `Outcome`) |
-| 6 | `apply.py` | `apply` | |
-| 7 | `cover.py` | `cover::{fetch, cache, local}` | |
+| 5 | `worker.py` | `worker` | done (`test_worker`, `test_mailbox`, `test_worker_integration`; the real-resolver identity cases move with step 7) |
+| 6 | `apply.py` | `apply` | `CtlError` only |
+| 7 | `cover.py` | `cover::{fetch, cache, local}` | `Resolution`, `content_id` only |
 | 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
 | 9 | integration tests | `tests/*.rs` against `tools/fake_mpris.py` | |
 
@@ -77,6 +77,13 @@ depend on every sample byte.
   reachable through the public API, in either language: every change of
   desired value bumps the generation, which cancels the retry first. It is
   kept as defence in depth; no test covers it.
+- The worker's four injected stages are a `worker::Stages` trait. Python's
+  catch-all around a job becomes `catch_unwind`: a panic in a stage is
+  reported as a retryable failure and the loop survives. `WorkerHandle`
+  replaces the daemon thread: `stop_and_join` waits up to its timeout and
+  then leaves a wedged thread detached, as the Python's daemon thread is.
+  The real-thread lifecycle tests are opt-in in Python but run by default
+  here (they take milliseconds).
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
 - JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
