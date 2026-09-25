@@ -53,7 +53,7 @@ depend on every sample byte.
 | 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | done (`test_decide`'s `_follow_cmd` cases move with step 8) |
 | 4 | `coordinator.py` | `coordinator` | done (all `test_coordinator` cases) |
 | 5 | `worker.py` | `worker` | done (`test_worker`, `test_mailbox`, `test_worker_integration`; the real-resolver identity cases move with step 7) |
-| 6 | `apply.py` | `apply` | `CtlError` only |
+| 6 | `apply.py` | `apply` | done (all `test_apply` cases, plus real-process runner tests) |
 | 7 | `cover.py` | `cover::{fetch, cache, local}` | `Resolution`, `content_id` only |
 | 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
 | 9 | integration tests | `tests/*.rs` against `tools/fake_mpris.py` | |
@@ -84,6 +84,14 @@ depend on every sample byte.
   then leaves a wedged thread detached, as the Python's daemon thread is.
   The real-thread lifecycle tests are opt-in in Python but run by default
   here (they take milliseconds).
+- `apply` runs ctl through an injectable `Runner` (Python injects
+  `subprocess.run`). `WLCHROMA_CTL` or the bare `wlchroma-ctl` (resolved on
+  `PATH` at spawn) replaces `shutil.which`. On timeout the child is killed
+  and reaped without waiting on its pipes, as `subprocess.run` does. One
+  deliberate difference: if ctl exits but leaves a descendant holding
+  stderr, Python's `communicate()` waits out the timeout and reports a
+  timeout error, while the port reports ctl's real exit status (stderr is
+  awaited only until the same deadline).
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
 - JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
