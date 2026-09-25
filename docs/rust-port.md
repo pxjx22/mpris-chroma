@@ -1,32 +1,17 @@
-# mpris-chroma (Rust port)
+# The Rust port
 
-A module-by-module port of the Python daemon in `../mpris_chroma`. The Python
-package stays the reference implementation, and keeps running as the daemon,
-until this crate reaches parity. At that point the crate moves to the repo root
-and the Python is removed in one commit.
+mpris-chroma was a Python daemon (PyGObject, dbus-python, Pillow) until it
+was ported module by module to Rust, with the Python kept as the reference
+until the port reached parity. The last commit with the Python is 992678e;
+check it out to read or run the original.
 
-```bash
-cd rust
-cargo test
-cargo build --release   # target/release/mpris-chroma
-```
+## How parity was checked
 
-The binary is a drop-in for `python -m mpris_chroma.sync`: same players,
-same paths under `$HOME`, same environment (`WLCHROMA_CTL`,
-`MPRIS_CHROMA_MODE`, `MPRIS_CHROMA_ART_DOMAINS`), plus
-`MPRIS_CHROMA_LOG=debug|info|warn|error`. It needs `playerctl` on `PATH` and
-a session bus, and links only glibc (no GLib, libdbus or Python).
-
-## Parity
-
-Unit tests port the Python tests case for case. Two golden suites also check
-exact values against fixtures recorded from the Python code:
-
-```bash
-# from the repo root, after changing any ported Python module
-python tools/dump_golden.py > rust/tests/fixtures/color_golden.json
-python tools/dump_image_golden.py   # needs Pillow; writes images/, samples/, JSON
-```
+Every Python test case was ported (bar one that needs a mocked `stat`). Two
+golden suites also check exact values against fixtures recorded from the
+Python by `tools/dump_golden.py` and `tools/dump_image_golden.py` (both at
+992678e). The fixtures are now frozen: a change that breaks them changes the
+colours the daemon picks.
 
 - `tests/color_golden.rs`: the color math over a seeded corpus. Hex output,
   separation reasons and flags must match exactly; floats to 1e-10, which
@@ -40,6 +25,8 @@ python tools/dump_image_golden.py   # needs Pillow; writes images/, samples/, JS
   and resize also reproduce Pillow's sample byte for byte, so the whole
   pipeline matches. JPEG and lossy WebP use different decoders; their
   palettes must stay within dE 0.03 of Pillow's (measured worst: 0.012).
+- `tests/daemon_e2e.rs` checks the whole daemon applies Python's palette for
+  a fixture cover.
 
 Two rounding rules are easy to get wrong:
 
@@ -50,20 +37,6 @@ Two rounding rules are easy to get wrong:
 (`libImaging/Quant.c`, `QuantHeap.c`, `Resample.c`), because no Rust crate
 reproduces Pillow's median cut or fixed-point bicubic, and the picked colours
 depend on every sample byte.
-
-## Status
-
-| Step | Python | Rust | State |
-|---|---|---|---|
-| 1 | `oklab.py`, `tone.py`, `ramp.py`, `colors.render_palette` | `color::{oklab, tone, ramp}`, `color::render_palette` | done, golden-checked |
-| 2 | `colors.py` decode / quantize / select, `PaletteMemo` | `color::{decode, resize, quantize, pick}`, `color::{select_palette, extract_colors, PaletteMemo}` | done, golden-checked |
-| 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | done (`test_decide`'s `_follow_cmd` cases move with step 8) |
-| 4 | `coordinator.py` | `coordinator` | done (all `test_coordinator` cases) |
-| 5 | `worker.py` | `worker` | done (`test_worker`, `test_mailbox`, `test_worker_integration`; the real-resolver identity cases move with step 7) |
-| 6 | `apply.py` | `apply` | done (all `test_apply` cases, plus real-process runner tests) |
-| 7 | `cover.py` | `cover::{policy, fetch, cache, local}` | done (all `test_cover` cases bar one, plus the two real-resolver worker cases) |
-| 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `daemon`, `main.rs` | done |
-| 9 | integration tests | `tests/daemon_e2e.rs`, runtime flood test, D-Bus tests on a private bus | done |
 
 ## Deliberate differences from the Python
 
@@ -99,6 +72,18 @@ depend on every sample byte.
   stderr, Python's `communicate()` waits out the timeout and reports a
   timeout error, while the port reports ctl's real exit status (stderr is
   awaited only until the same deadline).
+- `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
+  `ValueError`. Either way it is a caller bug.
+- JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
+  block-averaging to the same draft size. 16-bit PNGs follow Pillow's raw
+  modes (high byte for colour; 16-bit grey clips at 255, as Pillow's `I;16`
+  conversion does).
+- The quantizer does not port Pillow's reduced-precision rehash, which only
+  triggers past 65536 distinct colours; the 100x100 sample has at most 10000.
+- `PaletteMemo` is `get(path, mode, content_id)` over injectable halves; a
+  panicking select leaves the slot untouched, as a raising one does in Python.
+  The "logged once" part of the Python memo test is covered by counting
+  select calls instead of capturing logs.
 
 ### Cover resolution
 
@@ -140,8 +125,8 @@ scan memo, the log limiter) are fields of `CoverResolver`.
 
 ### Event loop
 
-GLib is gone. Each source is a thread feeding one bounded channel
-(`runtime::EVENT_QUEUE`): the playerctl reader (framing on its thread, one
+The Python ran on a GLib main loop; the port has none. Each source is a
+thread feeding one bounded channel (`runtime::EVENT_QUEUE`): the playerctl reader (framing on its thread, one
 64 KiB read at a time), `zbus` listeners for `NameOwnerChanged` and the
 portal's `SettingChanged` (pinned to the portal's bus name and path),
 `signal-hook` for SIGTERM/SIGINT, and the worker's results. The loop
@@ -164,15 +149,3 @@ whole pipeline with a fake playerctl and a fake `wlchroma-ctl` that logs its
 argv, and checks the applied colours equal Python's for the same cover; one
 case runs the real binary on a private bus, triggers a vanish revert by
 releasing a player's name, and stops it with SIGTERM.
-- `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
-  `ValueError`. Either way it is a caller bug.
-- JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
-  block-averaging to the same draft size. 16-bit PNGs follow Pillow's raw
-  modes (high byte for colour; 16-bit grey clips at 255, as Pillow's `I;16`
-  conversion does).
-- The quantizer does not port Pillow's reduced-precision rehash, which only
-  triggers past 65536 distinct colours; the 100x100 sample has at most 10000.
-- `PaletteMemo` is `get(path, mode, content_id)` over injectable halves; a
-  panicking select leaves the slot untouched, as a raising one does in Python.
-  The "logged once" part of the Python memo test is covered by counting
-  select calls instead of capturing logs.

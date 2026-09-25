@@ -1,6 +1,7 @@
 //! Image pipeline parity with Pillow, on synthetic covers.
 //!
-//! Fixtures come from `tools/dump_image_golden.py` (sources in
+//! The fixtures were recorded from the Python implementation this crate
+//! replaced (`tools/dump_image_golden.py` at commit 992678e; sources in
 //! `fixtures/images/`, Pillow's 100x100 samples in `fixtures/samples/`). Three
 //! layers, so a failure says which stage diverged:
 //!

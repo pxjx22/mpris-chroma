@@ -1,7 +1,8 @@
 //! Parity with the Python pipeline over a seeded corpus.
 //!
-//! Fixtures come from `tools/dump_golden.py` (regenerate from the repo root
-//! with `python tools/dump_golden.py > rust/tests/fixtures/color_golden.json`).
+//! The fixtures were recorded from the Python implementation this crate
+//! replaced (`tools/dump_golden.py` at commit 992678e, the last with the
+//! Python), so they are frozen: a change that fails here changes the colours.
 //! Hex strings, reasons and flags must match exactly; floats must match to
 //! `EPS`, which allows for ulp-level libm differences (cbrt, pow, hypot)
 //! between CPython and Rust while catching any real divergence.

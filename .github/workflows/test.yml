@@ -7,67 +7,20 @@ on:
 
 jobs:
   test:
-    # Pinned rather than ubuntu-latest: a matrix job's system-package names
-    # (PyGObject/dbus-python's dev headers) are tied to the Ubuntu release,
-    # so an unannounced runner-image bump could silently break this job on a
-    # push that touched nothing here.
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
-
     steps:
       - uses: actions/checkout@v4
 
-      # PyGObject and dbus-python are declared project dependencies
-      # (pyproject.toml) and build from source on install; they need these
-      # headers present, not just their runtime .so's.
-      - name: Install system dependencies (PyGObject/dbus-python headers)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config gcc python3-dev \
-            libglib2.0-dev libgirepository1.0-dev \
-            libcairo2-dev libdbus-1-dev
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
-
-      - name: Install the project
-        run: python -m pip install --upgrade pip && python -m pip install .
-
-      - name: Byte-compile (catches syntax errors this Python can't parse)
-        run: python -m compileall -q mpris_chroma
-
-      - name: Run the test suite
-        # PY-003's scope is the pure-logic suite (cover resolution, color
-        # extraction, state transitions), which needs no desktop session or
-        # running D-Bus/wlchroma. The 4 GLib-loop / real-bus integration
-        # tests stay opt-in (MPRIS_CHROMA_INTEGRATION=1) and are not run
-        # here — they need a live session bus this runner doesn't have.
-        run: python -m unittest discover -s tests -v
-
-  rust:
-    # The Rust port in rust/ (see rust/README.md). Pure-logic only so far, so
-    # no system packages are needed; this grows alongside the port.
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: rust
-    steps:
-      - uses: actions/checkout@v4
+      # dbus-daemon runs the D-Bus tests and the real-binary end-to-end test
+      # on a private bus (they skip themselves where it is missing).
+      - name: Install dbus-daemon
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus-daemon
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
 
       - name: Format
         run: cargo fmt --check
