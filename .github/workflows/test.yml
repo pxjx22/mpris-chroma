@@ -50,3 +50,30 @@ jobs:
         # tests stay opt-in (MPRIS_CHROMA_INTEGRATION=1) and are not run
         # here — they need a live session bus this runner doesn't have.
         run: python -m unittest discover -s tests -v
+
+  rust:
+    # The Rust port in rust/ (see rust/README.md). Pure-logic only so far, so
+    # no system packages are needed; this grows alongside the port.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

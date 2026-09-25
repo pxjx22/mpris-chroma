@@ -12,3 +12,6 @@ tools/verdicts.json
 # them would nest the tree inside itself, and leaving them untracked lets a
 # `git add -A` in one session sweep another session's worktree into its commit.
 .claude/worktrees/
+
+# Rust port build output.
+rust/target/

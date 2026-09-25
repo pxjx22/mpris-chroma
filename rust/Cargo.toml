@@ -1,0 +1,15 @@
+[package]
+name = "mpris-chroma"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# Dependencies are added as the modules that need them are ported (see
+# README.md for the order), so nothing here is compiled before it is used.
+[dependencies]
+log = "0.4"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
