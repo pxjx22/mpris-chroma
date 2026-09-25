@@ -476,6 +476,14 @@ impl<H: Host> Coordinator<H> {
             self.host.submit(self.generation, desired);
             return;
         }
+        match (&desired.target, &player) {
+            (Some(t), Some(p)) if t.art_url.is_empty() => {
+                log::info!("{p} is playing: covers dir scan ({})", desired.mode)
+            }
+            (Some(t), Some(p)) => log::info!("{p} is playing: {} ({})", t.art_url, desired.mode),
+            (Some(t), None) => log::info!("cover {} ({})", t.art_url, desired.mode),
+            (None, _) => log::info!("nothing playing: revert to the preset"),
+        }
         self.generation += 1;
         self.cancel_retry(); // guard 1: a new desired value supersedes any armed retry
         self.last_submitted = Some(desired.clone());

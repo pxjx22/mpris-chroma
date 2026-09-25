@@ -5,7 +5,8 @@
 //! - `MPRIS_CHROMA_MODE=light|dark`: force the palette mode; otherwise the
 //!   desktop color-scheme is followed live via the settings portal.
 //! - `MPRIS_CHROMA_ART_DOMAINS`: extra allowlisted artwork domains.
-//! - `MPRIS_CHROMA_LOG=debug|info|warn|error`: log level (default warn).
+//! - `MPRIS_CHROMA_LOG=debug|info|warn|error`: log level (default info: one
+//!   line per palette change).
 
 use std::sync::mpsc::sync_channel;
 
@@ -17,12 +18,23 @@ use mpris_chroma::sources::{dbus, playerctl, signals};
 use mpris_chroma::state::Mode;
 
 /// Logs to stderr with sd-daemon priority prefixes, which journald parses
-/// into levels.
+/// into levels. `MPRIS_CHROMA_LOG` sets the level for this crate only;
+/// dependencies (ureq, rustls, zbus) log at warn and above, since their
+/// debug output drowns the daemon's own.
 struct JournalLogger(log::LevelFilter);
+
+fn is_own(target: &str) -> bool {
+    target == "mpris_chroma" || target.starts_with("mpris_chroma::")
+}
 
 impl log::Log for JournalLogger {
     fn enabled(&self, meta: &log::Metadata<'_>) -> bool {
-        meta.level() <= self.0
+        let limit = if is_own(meta.target()) {
+            self.0
+        } else {
+            log::LevelFilter::Warn
+        };
+        meta.level() <= limit
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -33,7 +45,12 @@ impl log::Log for JournalLogger {
                 log::Level::Info => 6,
                 log::Level::Debug | log::Level::Trace => 7,
             };
-            eprintln!("<{prio}>{}: {}", record.target(), record.args());
+            let target = record.target();
+            if is_own(target) {
+                eprintln!("<{prio}>{}", record.args());
+            } else {
+                eprintln!("<{prio}>{target}: {}", record.args());
+            }
         }
     }
 
@@ -45,11 +62,12 @@ fn init_logging() {
         Ok("debug") => log::LevelFilter::Debug,
         Ok("info") => log::LevelFilter::Info,
         Ok("error") => log::LevelFilter::Error,
-        _ => log::LevelFilter::Warn,
+        Ok("warn") => log::LevelFilter::Warn,
+        _ => log::LevelFilter::Info,
     };
     let logger: &'static JournalLogger = Box::leak(Box::new(JournalLogger(level)));
     if log::set_logger(logger).is_ok() {
-        log::set_max_level(level);
+        log::set_max_level(level.max(log::LevelFilter::Warn));
     }
 }
 

@@ -219,14 +219,17 @@ impl<S: Stages> Worker<S> {
         let Some(target) = desired.target else {
             let key = Committed::Revert(desired.mode);
             if self.last_committed == Some(key) {
+                log::debug!("revert skipped: wlchroma already shows the preset");
                 return result(Outcome::SkippedDuplicate, None);
             }
             if self.mailbox.superseded(generation) {
                 return None; // a newer desire is waiting; drop this stale revert
             }
-            if self.stages.revert().is_err() {
+            if let Err(e) = self.stages.revert() {
+                log::info!("revert failed, will retry: {e}");
                 return result(Outcome::FailedRetryable, None);
             }
+            log::info!("reverted to the preset");
             self.last_committed = Some(key);
             return result(Outcome::Committed, None);
         };
@@ -234,14 +237,21 @@ impl<S: Stages> Worker<S> {
             .stages
             .resolve(&target.art_url, target.covers_dir.as_deref())
         {
-            Resolution::Retryable(_) => return result(Outcome::FailedRetryable, None),
-            Resolution::Rejected(_) => return result(Outcome::Rejected, None),
+            Resolution::Retryable(why) => {
+                log::info!("cover not available yet, will retry: {why}");
+                return result(Outcome::FailedRetryable, None);
+            }
+            Resolution::Rejected(why) => {
+                log::info!("cover rejected: {why}");
+                return result(Outcome::Rejected, None);
+            }
             Resolution::Ready { path, content_id } => (path, content_id),
         };
         let cover_id = Some(path.display().to_string());
         // Dedup on content identity, not pathname.
         let key = Committed::Cover(content_id, desired.mode);
         if self.last_committed == Some(key) {
+            log::debug!("{} already applied ({})", path.display(), desired.mode);
             return result(Outcome::SkippedDuplicate, cover_id);
         }
         if self.mailbox.superseded(generation) {
@@ -253,9 +263,16 @@ impl<S: Stages> Worker<S> {
             // desire may have arrived during it (guarantee b).
             return None;
         }
-        if self.stages.apply(&colors).is_err() {
+        if let Err(e) = self.stages.apply(&colors) {
+            log::info!("apply failed, will retry: {e}");
             return result(Outcome::FailedRetryable, None);
         }
+        log::info!(
+            "applied {} from {} ({})",
+            colors.join(" "),
+            path.display(),
+            desired.mode
+        );
         self.last_committed = Some(key);
         result(Outcome::Committed, cover_id)
     }
