@@ -8,7 +8,14 @@ and the Python is removed in one commit.
 ```bash
 cd rust
 cargo test
+cargo build --release   # target/release/mpris-chroma
 ```
+
+The binary is a drop-in for `python -m mpris_chroma.sync`: same players,
+same paths under `$HOME`, same environment (`WLCHROMA_CTL`,
+`MPRIS_CHROMA_MODE`, `MPRIS_CHROMA_ART_DOMAINS`), plus
+`MPRIS_CHROMA_LOG=debug|info|warn|error`. It needs `playerctl` on `PATH` and
+a session bus, and links only glibc (no GLib, libdbus or Python).
 
 ## Parity
 
@@ -55,8 +62,8 @@ depend on every sample byte.
 | 5 | `worker.py` | `worker` | done (`test_worker`, `test_mailbox`, `test_worker_integration`; the real-resolver identity cases move with step 7) |
 | 6 | `apply.py` | `apply` | done (all `test_apply` cases, plus real-process runner tests) |
 | 7 | `cover.py` | `cover::{policy, fetch, cache, local}` | done (all `test_cover` cases bar one, plus the two real-resolver worker cases) |
-| 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
-| 9 | integration tests | `tests/*.rs` against `tools/fake_mpris.py` | |
+| 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `daemon`, `main.rs` | done |
+| 9 | integration tests | `tests/daemon_e2e.rs`, runtime flood test, D-Bus tests on a private bus | done |
 
 ## Deliberate differences from the Python
 
@@ -130,6 +137,33 @@ the directory's mtime back after adding a newer cover. The Python's
 `stat`); per-candidate errors are skipped structurally (`local::candidate`
 returns `None` on any error). The Python module globals (`CACHE_DIR`, the
 scan memo, the log limiter) are fields of `CoverResolver`.
+
+### Event loop
+
+GLib is gone. Each source is a thread feeding one bounded channel
+(`runtime::EVENT_QUEUE`): the playerctl reader (framing on its thread, one
+64 KiB read at a time), `zbus` listeners for `NameOwnerChanged` and the
+portal's `SettingChanged` (pinned to the portal's bus name and path),
+`signal-hook` for SIGTERM/SIGINT, and the worker's results. The loop
+checks the retry deadline after every event as well as on timeout, so a
+flood cannot starve it; the bounded channel makes a flooding reader block,
+so backpressure reaches the pipe as it does under GLib. Shutdown runs the
+same sequence as `sync.main`: invalidate results, clear the mailbox, abort
+downloads, join the worker (10 s), revert, reap playerctl (SIGTERM, then
+SIGKILL after 5 s). playerctl dying or the worker thread dying exits 1 for
+`Restart=on-failure`.
+
+Tests: the Python's flood and heartbeat tests become
+`runtime::tests::a_retry_fires_on_time_under_an_input_flood`, driven by an
+event source that never times out (a threaded flood could not saturate the
+channel reliably, so it could not tell a correct loop from one that only
+checks the timer on timeout). The D-Bus tests run against a private
+`dbus-daemon` (skipped where it is not installed), including an impostor
+peer whose `SettingChanged` must be ignored. `tests/daemon_e2e.rs` runs the
+whole pipeline with a fake playerctl and a fake `wlchroma-ctl` that logs its
+argv, and checks the applied colours equal Python's for the same cover; one
+case runs the real binary on a private bus, triggers a vanish revert by
+releasing a player's name, and stops it with SIGTERM.
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
 - JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and

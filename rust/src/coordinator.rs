@@ -651,6 +651,22 @@ mod tests {
 
     use Outcome::*;
 
+    // --- bus names (test_bus.py) -----------------------------------------
+
+    #[test]
+    fn bus_names_map_to_player_names() {
+        assert_eq!(
+            player_name_from_bus("org.mpris.MediaPlayer2.spotify"),
+            Some("spotify")
+        );
+        assert_eq!(
+            player_name_from_bus("org.mpris.MediaPlayer2.jellyfin-tui.instance7"),
+            Some("jellyfin-tui.instance7")
+        );
+        assert_eq!(player_name_from_bus("org.freedesktop.Notifications"), None);
+        assert_eq!(player_name_from_bus(":1.42"), None);
+    }
+
     // --- colour scheme map -----------------------------------------------
 
     #[test]

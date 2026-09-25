@@ -267,15 +267,18 @@ impl<S: Stages> Worker<S> {
 pub struct WorkerHandle {
     mailbox: Arc<Mailbox>,
     stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     finished: mpsc::Receiver<()>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
-/// Signals `finished` when the thread exits, however it exits.
-struct ExitSignal(mpsc::Sender<()>);
+/// Clears `alive` and signals `finished` when the thread exits, however it
+/// exits (including a panic that escapes the per-job backstop).
+struct ExitSignal(mpsc::Sender<()>, Arc<AtomicBool>);
 
 impl Drop for ExitSignal {
     fn drop(&mut self) {
+        self.1.store(false, Ordering::SeqCst);
         let _ = self.0.send(());
     }
 }
@@ -286,16 +289,18 @@ impl WorkerHandle {
         let mailbox = Arc::clone(&worker.mailbox);
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, finished) = mpsc::channel();
-        let thread_stop = Arc::clone(&stop);
+        let alive = Arc::new(AtomicBool::new(true));
+        let (thread_stop, thread_alive) = (Arc::clone(&stop), Arc::clone(&alive));
         let thread = thread::Builder::new()
             .name("palette-worker".into())
             .spawn(move || {
-                let _exit = ExitSignal(tx);
+                let _exit = ExitSignal(tx, thread_alive);
                 worker.run(&thread_stop);
             })?;
         Ok(Self {
             mailbox,
             stop,
+            alive,
             finished,
             thread: Some(thread),
         })
@@ -323,7 +328,12 @@ impl WorkerHandle {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    /// A shared view of [`Self::is_alive`], for the coordinator's host.
+    pub fn liveness(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.alive)
     }
 }
 
@@ -861,6 +871,23 @@ mod tests {
             handle.stop_and_join(Duration::from_secs(2)),
             "blocked worker not woken"
         );
+        assert!(!handle.is_alive());
+    }
+
+    #[test]
+    fn liveness_clears_when_the_thread_dies() {
+        // A panic in `report` escapes the per-job backstop and kills the
+        // thread; the liveness flag must say so.
+        let mb = Arc::new(Mailbox::new());
+        let w = Worker::new(Arc::clone(&mb), fake(), |_| panic!("report blew up"), None);
+        let handle = WorkerHandle::start(w).unwrap();
+        let alive = handle.liveness();
+        assert!(alive.load(Ordering::SeqCst));
+        mb.put(apply_job(1, "http://x", Mode::Dark));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while alive.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(!handle.is_alive());
     }
 
