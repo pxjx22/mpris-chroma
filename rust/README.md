@@ -34,9 +34,9 @@ Two rounding rules are easy to get wrong:
 |---|---|---|---|
 | 1 | `oklab.py`, `tone.py`, `ramp.py`, `colors.render_palette` | `color::{oklab, tone, ramp}`, `color::render_palette` | done, golden-checked |
 | 2 | `colors.py` decode / quantize / select, `PaletteMemo` | `color::{decode, quantize}`, `color::select_palette` | next |
-| 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | `state::Mode` only |
+| 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | done (`test_decide`'s `_follow_cmd` cases move with step 8) |
 | 4 | `coordinator.py` | `coordinator` | |
-| 5 | `worker.py` | `worker` | |
+| 5 | `worker.py` | `worker` | `CoverTarget`, `Desired` only |
 | 6 | `apply.py` | `apply` | |
 | 7 | `cover.py` | `cover::{fetch, cache, local}` | |
 | 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
@@ -51,7 +51,11 @@ covers.
 
 - `oklab::max_chroma` has no memo. The `lru_cache` exists for CPython's speed;
   compiled bisection costs well under a microsecond.
-- String states become enums (`Mode`, `SeparationReason`, and later the cover
-  and job outcomes).
+- String states become enums (`Mode`, `SeparationReason`, `PlaybackStatus`,
+  and later the cover and job outcomes). `PlayerState.status` is a
+  `PlaybackStatus`, so the MPRIS domain check (SEC-011 §2.3) happens at parse
+  time rather than at the coordinator.
+- `select::decide` returns a `Selection` enum (`Apply`/`Revert`/`Hold`)
+  instead of the Python's tuple-or-`None`.
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
