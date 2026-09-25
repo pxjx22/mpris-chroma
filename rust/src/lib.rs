@@ -7,6 +7,7 @@
 //! the Python code by `tools/dump_golden.py`.
 
 pub mod color;
+pub mod coordinator;
 pub mod framing;
 pub mod select;
 pub mod state;

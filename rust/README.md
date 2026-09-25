@@ -51,8 +51,8 @@ depend on every sample byte.
 | 1 | `oklab.py`, `tone.py`, `ramp.py`, `colors.render_palette` | `color::{oklab, tone, ramp}`, `color::render_palette` | done, golden-checked |
 | 2 | `colors.py` decode / quantize / select, `PaletteMemo` | `color::{decode, resize, quantize, pick}`, `color::{select_palette, extract_colors, PaletteMemo}` | done, golden-checked |
 | 3 | `framing.py`, `state.py`, `select.py` | `framing`, `state`, `select` | done (`test_decide`'s `_follow_cmd` cases move with step 8) |
-| 4 | `coordinator.py` | `coordinator` | |
-| 5 | `worker.py` | `worker` | `CoverTarget`, `Desired` only |
+| 4 | `coordinator.py` | `coordinator` | done (all `test_coordinator` cases) |
+| 5 | `worker.py` | `worker` | job/result types only (`Desired`, `JobResult`, `Outcome`) |
 | 6 | `apply.py` | `apply` | |
 | 7 | `cover.py` | `cover::{fetch, cache, local}` | |
 | 8 | `sync.py` | `sources::{playerctl, dbus, signals}`, `runtime`, `main.rs` | |
@@ -68,6 +68,15 @@ depend on every sample byte.
   time rather than at the coordinator.
 - `select::decide` returns a `Selection` enum (`Apply`/`Revert`/`Hold`)
   instead of the Python's tuple-or-`None`.
+- The coordinator's injected callables (submit, schedule, cancel, jitter,
+  clock) are one `coordinator::Host` trait. Warnings go through `Host::warn`,
+  so the drop-log tests count them where the Python uses `assertLogs`. The
+  retry timer calls `Coordinator::fire_retry()`, like the Python's bound
+  `_fire_retry`. `gen` is a reserved word in Rust 2024, so it is `generation`.
+- `fire_retry`'s "guard 2" (desire moved on between arm and fire) is not
+  reachable through the public API, in either language: every change of
+  desired value bumps the generation, which cancels the retry first. It is
+  kept as defence in depth; no test covers it.
 - `tone::separate` panics on `n_distinct > slots.len()`, where Python raises
   `ValueError`. Either way it is a caller bug.
 - JPEG draft (libjpeg's scaled IDCT) is emulated by decoding at full size and
