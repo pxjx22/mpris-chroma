@@ -86,15 +86,31 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, fs::File)> {
 /// Atomically publish `data` at `dest`: a reader never sees a partial file,
 /// a crash cannot leave a published partial entry, and the temp file is
 /// removed on every failure path.
+///
+/// The data is synced before the rename. Without that, a crash after the
+/// rename can leave a zero-length entry under the published name (delayed
+/// allocation), which the cache would then serve as a hit for every play of
+/// that URL. The directory is synced after, best-effort, so the rename
+/// itself survives a crash. (The Python syncs neither.)
 pub fn publish(dest: &Path, data: &[u8]) -> io::Result<()> {
     let dir = dest.parent().unwrap_or(Path::new("."));
     let (tmp, mut file) = create_temp(dir)?;
-    let result = file.write_all(data).and_then(|()| {
-        drop(file);
-        fs::rename(&tmp, dest)
-    });
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    let result = file
+        .write_all(data)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            drop(file);
+            fs::rename(&tmp, dest)
+        });
+    match &result {
+        Ok(()) => {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&tmp);
+        }
     }
     result
 }

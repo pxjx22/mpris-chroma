@@ -33,6 +33,8 @@ pub const CTL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DIAG: usize = 200;
 /// Bytes of ctl stderr read at all; the rest is drained unread.
 const MAX_STDERR_READ: u64 = 64 * 1024;
+/// Minimum wait for ctl's stderr after it exits, even at the deadline.
+const STDERR_GRACE: Duration = Duration::from_millis(100);
 
 /// The named palette to fall back to when the config preset is unusable.
 pub const FALLBACK_PALETTE: &str = "witch_hour";
@@ -127,7 +129,11 @@ impl Runner for ProcessRunner {
                 return Err(RunError::Timeout);
             }
         };
-        let left = deadline.saturating_duration_since(Instant::now());
+        // At least a short grace: ctl exiting right at the deadline has its
+        // stderr in flight, and the diagnostic is worth a few milliseconds.
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .max(STDERR_GRACE);
         let buf = rx.recv_timeout(left).unwrap_or_default();
         Ok(RunOutput {
             code: status.code(),
